@@ -3,7 +3,7 @@ import {
   Plus, Trash2, Check, X, Clock, Calendar as CalendarIcon, Play, Pause,
   RotateCcw, BookOpen, Brain, BarChart3, Lightbulb, Newspaper, Bell,
   ChevronLeft, ChevronRight, Shuffle, Flame, Star, CircleDot, Sparkles,
-  Volume2, Award, Layers, ClipboardList, Wand2
+  Volume2, Award, Layers, ClipboardList, Wand2, Download, Upload
 } from "lucide-react";
 import {
   RadialBarChart, RadialBar, PolarAngleAxis, ResponsiveContainer, Legend
@@ -82,9 +82,12 @@ const seedSubjects = () => [
 /* ---------------------------------------------------------------
    STORAGE HELPERS
 ----------------------------------------------------------------*/
+const STORAGE_PREFIX = "plano-estudos:";
+const DATA_KEYS = ["subjects", "schedule", "agenda", "decks", "pomo-settings", "concursos"];
+
 async function loadKey(key, fallback) {
   try {
-    const raw = window.localStorage.getItem(`plano-estudos:${key}`);
+    const raw = window.localStorage.getItem(`${STORAGE_PREFIX}${key}`);
     return raw ? JSON.parse(raw) : fallback;
   } catch {
     return fallback;
@@ -92,10 +95,50 @@ async function loadKey(key, fallback) {
 }
 async function saveKey(key, value) {
   try {
-    window.localStorage.setItem(`plano-estudos:${key}`, JSON.stringify(value));
+    window.localStorage.setItem(`${STORAGE_PREFIX}${key}`, JSON.stringify(value));
   } catch (e) {
     console.error("storage save failed", key, e);
   }
+}
+
+function exportAllData() {
+  const payload = { app: "diario-oficial-estudos", version: 1, exportedAt: new Date().toISOString(), data: {} };
+  DATA_KEYS.forEach((key) => {
+    const raw = window.localStorage.getItem(`${STORAGE_PREFIX}${key}`);
+    if (raw !== null) {
+      try { payload.data[key] = JSON.parse(raw); } catch { /* skip corrupted key */ }
+    }
+  });
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const stamp = new Date().toISOString().slice(0, 10);
+  a.href = url;
+  a.download = `registro-estudos-${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function importAllData(file, onDone) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const parsed = JSON.parse(reader.result);
+      const data = parsed?.data && typeof parsed.data === "object" ? parsed.data : parsed;
+      DATA_KEYS.forEach((key) => {
+        if (data[key] !== undefined) {
+          window.localStorage.setItem(`${STORAGE_PREFIX}${key}`, JSON.stringify(data[key]));
+        }
+      });
+      onDone(true);
+    } catch (e) {
+      onDone(false, e.message);
+    }
+  };
+  reader.onerror = () => onDone(false, "Não foi possível ler o arquivo.");
+  reader.readAsText(file);
 }
 
 /* ---------------------------------------------------------------
@@ -246,9 +289,31 @@ export default function StudyPlanner() {
 }
 
 function Header() {
+  const fileInputRef = useRef(null);
+  const [msg, setMsg] = useState(null);
+
+  const handleImportClick = () => fileInputRef.current?.click();
+  const handleFileChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!window.confirm("Importar este arquivo vai substituir os dados atuais do app neste dispositivo. Deseja continuar?")) {
+      e.target.value = "";
+      return;
+    }
+    importAllData(file, (ok, error) => {
+      if (ok) {
+        setMsg({ type: "ok", text: "Registro importado! Recarregando…" });
+        setTimeout(() => window.location.reload(), 900);
+      } else {
+        setMsg({ type: "err", text: `Falha ao importar: ${error || "arquivo inválido"}` });
+      }
+    });
+    e.target.value = "";
+  };
+
   return (
     <header className="px-4 sm:px-6 pt-6 pb-4 border-b" style={{ borderColor: COLORS.cardBorder }}>
-      <div className="max-w-5xl mx-auto flex items-center justify-between">
+      <div className="max-w-5xl mx-auto flex items-center justify-between gap-3 flex-wrap">
         <div>
           <div className="text-[10px] tracking-[0.25em] uppercase font-mono" style={{ color: COLORS.gold }}>
             Protocolo de Estudos
@@ -257,10 +322,20 @@ function Header() {
             Diário Oficial da Aprovação
           </h1>
         </div>
-        <div className="hidden sm:flex items-center justify-center w-14 h-14 rounded-full border-2" style={{ borderColor: COLORS.gold, color: COLORS.gold }}>
-          <Award size={24} />
+        <div className="flex items-center gap-2">
+          <Btn onClick={exportAllData} variant="ghost" small><Download size={13} /> Salvar registro</Btn>
+          <Btn onClick={handleImportClick} variant="ghost" small><Upload size={13} /> Abrir registro</Btn>
+          <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={handleFileChange} />
+          <div className="hidden sm:flex items-center justify-center w-14 h-14 rounded-full border-2" style={{ borderColor: COLORS.gold, color: COLORS.gold }}>
+            <Award size={24} />
+          </div>
         </div>
       </div>
+      {msg && (
+        <div className="max-w-5xl mx-auto mt-2 text-xs" style={{ color: msg.type === "ok" ? COLORS.teal : COLORS.rose }}>
+          {msg.text}
+        </div>
+      )}
     </header>
   );
 }
