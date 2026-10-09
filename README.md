@@ -68,6 +68,28 @@ npm run dev
 
 Abre em `http://localhost:5173`.
 
+## Pomodoro: alertas
+
+- Ao terminar o foco, o app mostra um aviso em tela cheia, toca um som, vibra
+  (celular) e envia uma notificação do sistema; o descanso começa sozinho.
+- Ao terminar o descanso, aparece outro aviso bem claro, com o botão
+  "Iniciar foco agora".
+- Toque em **Testar alerta** (aba Pomodoro) para conferir som e notificações
+  no seu aparelho. Na primeira vez, autorize as notificações.
+- Um site/PWA não consegue desenhar por cima de outros apps; o que aparece por
+  cima deles é a notificação do sistema. Se o navegador for suspenso em
+  segundo plano, o aviso pode atrasar.
+
+## Flashcards: Anki
+
+- **Exportar**: texto (.txt, que o Anki importa) ou pacote .apkg, para todos os
+  baralhos ou só o selecionado.
+- **Importar**: .apkg/.colpkg (baralhos completos), texto/CSV/TSV e colar
+  vários cartões de uma vez. Para pacotes .apkg/.colpkg (importar ou exportar), o app
+  baixa as bibliotecas (JSZip e sql.js) na primeira vez, então precisa de
+  internet nesse momento.
+- Imagens e áudios dos cartões do Anki não são importados.
+
 ## Observações
 
 - Os dados (cronograma, agenda, flashcards, concursos) ficam salvos no

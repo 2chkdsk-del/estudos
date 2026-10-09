@@ -3,11 +3,18 @@ import {
   Plus, Trash2, Check, X, Clock, Calendar as CalendarIcon, Play, Pause,
   RotateCcw, BookOpen, Brain, BarChart3, Lightbulb, Newspaper, Bell,
   ChevronLeft, ChevronRight, Shuffle, Flame, Star, CircleDot, Sparkles,
-  Volume2, Award, Layers, ClipboardList, Wand2, Download, Upload
+  Volume2, Award, Layers, ClipboardList, Wand2, Download, Upload, BellRing, Coffee, Trophy
 } from "lucide-react";
 import {
   RadialBarChart, RadialBar, PolarAngleAxis, ResponsiveContainer, Legend
 } from "recharts";
+import {
+  makePomoState, pomoRemainingMs, pomoStart, pomoPause, pomoSwitch, pomoReset, pomoAdvance, formatClock,
+} from "./pomodoroLogic.js";
+import { buildCelebration } from "./encouragement.js";
+import {
+  parseAnkiText, buildAnkiText, buildApkgBlob, parseApkgFile, mergeImportedCards,
+} from "./anki.js";
 
 /* ---------------------------------------------------------------
    TOKENS — "Diário Oficial de Estudos"
@@ -142,26 +149,79 @@ function importAllData(file, onDone) {
 }
 
 /* ---------------------------------------------------------------
-   AUDIO — subtle bell chime (Web Audio API, no assets needed)
+   AUDIO + ALERTAS (som, vibração, notificação do sistema)
 ----------------------------------------------------------------*/
-function playChime() {
+let _audioCtx = null;
+function getAudioCtx() {
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const now = ctx.currentTime;
-    [880, 1320].forEach((freq, i) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0, now + i * 0.18);
-      gain.gain.linearRampToValueAtTime(0.12, now + i * 0.18 + 0.05);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.18 + 1.1);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(now + i * 0.18);
-      osc.stop(now + i * 0.18 + 1.2);
-    });
-  } catch (e) { /* audio unavailable */ }
+    const C = window.AudioContext || window.webkitAudioContext;
+    if (!C) return null;
+    if (!_audioCtx) _audioCtx = new C();
+    return _audioCtx;
+  } catch { return null; }
+}
+// Chamar dentro de um clique: libera o áudio no celular/navegador.
+function unlockAudio() {
+  const c = getAudioCtx();
+  if (c && c.state === "suspended") c.resume().catch(() => {});
+}
+function playChime(kind = "soft") {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  if (ctx.state === "suspended") ctx.resume().catch(() => {});
+  const seqs = { soft: [880, 1320], "focus-done": [660, 880, 1100], "break-done": [1100, 880, 1100, 880] };
+  const notes = seqs[kind] || seqs.soft;
+  const vol = kind === "soft" ? 0.12 : 0.25;
+  const now = ctx.currentTime;
+  notes.forEach((freq, i) => {
+    const t0 = now + i * 0.24;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(vol, t0 + 0.05);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.0);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + 1.1);
+  });
+}
+function vibrateAlert() {
+  try { if (navigator.vibrate) navigator.vibrate([400, 200, 400, 200, 800]); } catch { /* sem vibração */ }
+}
+function notifSupported() { return typeof window !== "undefined" && "Notification" in window; }
+function requestNotifPermission() {
+  try {
+    if (notifSupported() && Notification.permission === "default") return Notification.requestPermission();
+  } catch { /* noop */ }
+  return Promise.resolve(notifSupported() ? Notification.permission : "unsupported");
+}
+async function showSystemNotification(title, body, tag) {
+  try {
+    if (!notifSupported() || Notification.permission !== "granted") return;
+    const opts = { body, tag, renotify: true, requireInteraction: true, vibrate: [400, 200, 400, 200, 800], icon: "/icon-192.png", badge: "/icon-192.png" };
+    const reg = navigator.serviceWorker ? await navigator.serviceWorker.getRegistration() : null;
+    if (reg && reg.showNotification) await reg.showNotification(title, opts);
+    else new Notification(title, opts);
+  } catch { /* notificação indisponível */ }
+}
+async function closeSystemNotifications(tag) {
+  try {
+    const reg = navigator.serviceWorker ? await navigator.serviceWorker.getRegistration() : null;
+    if (reg && reg.getNotifications) (await reg.getNotifications({ tag })).forEach((n) => n.close());
+  } catch { /* noop */ }
+}
+function fireAlert(alert) {
+  const focus = alert.kind === "focus-done";
+  const title = focus ? "Foco concluído!" : "Descanso acabou!";
+  const body = focus
+    ? `Hora de descansar ${Math.round(alert.breakMs / 60000)} min. O descanso já começou.`
+    : "Hora de voltar aos estudos.";
+  playChime(alert.kind);
+  vibrateAlert();
+  showSystemNotification(title, body, "pomodoro");
 }
 
 /* ---------------------------------------------------------------
@@ -187,6 +247,183 @@ function weightedRoundRobinPick(subjects, count) {
 }
 
 /* ---------------------------------------------------------------
+   POMODORO — estado no topo do app (continua rodando em qualquer aba)
+----------------------------------------------------------------*/
+function usePomodoro(settings) {
+  const [state, setState] = useState(() => makePomoState(settings));
+  const [alertInfo, setAlertInfo] = useState(null);
+  const [now, setNow] = useState(() => Date.now());
+  const stateRef = useRef(state);
+  const settingsRef = useRef(settings);
+  const wakeRef = useRef(null);
+  settingsRef.current = settings;
+
+  const apply = useCallback((ns) => { stateRef.current = ns; setState(ns); }, []);
+
+  const tick = useCallback(() => {
+    const t = Date.now();
+    if (stateRef.current.running) setNow(Math.floor(t / 1000) * 1000);
+    const r = pomoAdvance(stateRef.current, t, settingsRef.current);
+    if (r.changed) apply(r.state);
+    if (r.alert) { setAlertInfo(r.alert); fireAlert(r.alert); }
+  }, [apply]);
+
+  useEffect(() => {
+    const iv = setInterval(tick, 500);
+    const onVis = () => tick();
+    document.addEventListener("visibilitychange", onVis);
+    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", onVis); };
+  }, [tick]);
+
+  // Quando parado, acompanha mudanças nas configurações de tempo
+  useEffect(() => {
+    if (!stateRef.current.running) apply(pomoSwitch(stateRef.current, stateRef.current.mode, settings));
+  }, [settings.work, settings.short, settings.long]); // eslint-disable-line
+
+  // Mantém a tela acesa enquanto o timer roda (evita o celular suspender o app)
+  useEffect(() => {
+    const want = state.running;
+    const acquire = async () => {
+      try {
+        if (want && "wakeLock" in navigator && !wakeRef.current) {
+          wakeRef.current = await navigator.wakeLock.request("screen");
+          wakeRef.current.addEventListener("release", () => { wakeRef.current = null; });
+        }
+      } catch { /* sem wake lock */ }
+    };
+    if (want) acquire();
+    else if (wakeRef.current) { const w = wakeRef.current; wakeRef.current = null; w.release().catch(() => {}); }
+    const onVis = () => { if (document.visibilityState === "visible" && want) acquire(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [state.running]);
+
+  const start = () => {
+    unlockAudio();
+    requestNotifPermission();
+    setNow(Date.now());
+    apply(pomoStart(stateRef.current, Date.now()));
+  };
+  const pause = () => apply(pomoPause(stateRef.current, Date.now()));
+  const reset = () => apply(pomoReset(stateRef.current, settingsRef.current));
+  const switchMode = (m) => apply(pomoSwitch(stateRef.current, m, settingsRef.current));
+  const dismiss = () => { setAlertInfo(null); closeSystemNotifications("pomodoro"); };
+  const startFocusNow = () => {
+    unlockAudio();
+    dismiss();
+    const sw = pomoSwitch(stateRef.current, "work", settingsRef.current);
+    setNow(Date.now());
+    apply(pomoStart(sw, Date.now()));
+  };
+  const testAlert = () => {
+    unlockAudio();
+    requestNotifPermission().then(() => {
+      const a = { kind: "focus-done", breakMode: "short", breakMs: settingsRef.current.short * 60000, at: Date.now(), test: true };
+      setAlertInfo(a);
+      fireAlert(a);
+    });
+  };
+
+  return { state, now, alertInfo, start, pause, reset, switchMode, dismiss, startFocusNow, testAlert };
+}
+
+function PomodoroAlert({ pomo }) {
+  const a = pomo.alertInfo;
+  useEffect(() => {
+    if (!a) return undefined;
+    const original = document.title;
+    const msg = a.kind === "focus-done" ? "Foco concluído!" : "Descanso acabou!";
+    let n = 0;
+    const flash = setInterval(() => { document.title = n++ % 2 === 0 ? `⏰ ${msg}` : original; }, 900);
+    let repeats = 0;
+    const again = setInterval(() => {
+      if (++repeats > 5) { clearInterval(again); return; }
+      playChime(a.kind);
+      vibrateAlert();
+    }, 7000);
+    return () => { clearInterval(flash); clearInterval(again); document.title = original; };
+  }, [a]);
+
+  if (!a) return null;
+  const focusDone = a.kind === "focus-done";
+  const color = focusDone ? COLORS.teal : COLORS.rose;
+  const Icon = focusDone ? Coffee : BellRing;
+  const breakLeft = pomo.state.running && pomo.state.mode !== "work"
+    ? formatClock(pomoRemainingMs(pomo.state, pomo.now))
+    : formatClock(a.breakMs || 0);
+
+  return (
+    <div role="alertdialog" aria-live="assertive" className="fixed inset-0 z-[100] flex items-center justify-center p-4"
+      style={{ background: "rgba(5,10,18,0.88)", backdropFilter: "blur(6px)" }}>
+      <div className="w-full max-w-sm rounded-2xl border-2 p-6 text-center" style={{ background: COLORS.card, borderColor: color, boxShadow: `0 0 40px ${color}55` }}>
+        <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full animate-pulse" style={{ background: color, color: "#0B121D" }}>
+          <Icon size={30} />
+        </div>
+        {a.test && <div className="mb-1 text-[10px] font-mono uppercase tracking-widest" style={{ color: COLORS.sub }}>Teste de alerta</div>}
+        <h2 className="font-display text-2xl mb-2">{focusDone ? "Foco concluído!" : "O descanso acabou!"}</h2>
+        {focusDone ? (
+          <>
+            <p className="text-sm mb-3" style={{ color: COLORS.sub }}>Levante, beba água e descanse a vista. O descanso já começou:</p>
+            <div className="font-mono text-4xl mb-1" style={{ color }}>{breakLeft}</div>
+            <p className="text-[11px] mb-5" style={{ color: COLORS.sub }}>{a.breakMode === "long" ? "Pausa longa" : "Pausa curta"} em andamento. Você será avisado quando acabar.</p>
+            <Btn onClick={pomo.dismiss} className="w-full justify-center"><Check size={15} /> Entendi</Btn>
+          </>
+        ) : (
+          <>
+            <p className="text-sm mb-5" style={{ color: COLORS.sub }}>Hora de voltar aos estudos. Pronto para o próximo bloco de foco?</p>
+            <div className="flex flex-col gap-2">
+              <Btn onClick={pomo.startFocusNow} className="w-full justify-center"><Play size={15} /> Iniciar foco agora</Btn>
+              <Btn onClick={pomo.dismiss} variant="ghost" className="w-full justify-center">Fechar</Btn>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PomodoroChip({ pomo, tab, setTab }) {
+  if (!pomo.state.running || tab === "pomodoro") return null;
+  const modeLabel = { work: "Foco", short: "Pausa", long: "Pausa longa" }[pomo.state.mode];
+  const color = { work: COLORS.rose, short: COLORS.teal, long: COLORS.gold }[pomo.state.mode];
+  return (
+    <button onClick={() => setTab("pomodoro")} className="fixed bottom-4 right-4 z-[60] flex items-center gap-2 rounded-full border px-4 py-2 shadow-lg"
+      style={{ background: COLORS.card, borderColor: color, color: COLORS.text }}>
+      <Clock size={14} style={{ color }} />
+      <span className="font-mono text-sm">{formatClock(pomoRemainingMs(pomo.state, pomo.now))}</span>
+      <span className="text-[10px] uppercase tracking-widest" style={{ color }}>{modeLabel}</span>
+    </button>
+  );
+}
+
+function CelebrationToast({ celebration, onClose }) {
+  useEffect(() => {
+    if (!celebration) return undefined;
+    const t = setTimeout(onClose, celebration.kind === "subject" ? 10000 : 7000);
+    return () => clearTimeout(t);
+  }, [celebration]); // eslint-disable-line
+  if (!celebration) return null;
+  const big = celebration.kind === "subject";
+  const color = big ? COLORS.gold : COLORS.teal;
+  const Icon = big ? Trophy : Star;
+  return (
+    <div className="fixed left-1/2 top-4 z-[90] w-[92%] max-w-md -translate-x-1/2" role="status" aria-live="polite">
+      <div className={`flex gap-3 rounded-xl border-2 ${big ? "p-5" : "p-4"}`} style={{ background: COLORS.card, borderColor: color, boxShadow: `0 8px 30px ${color}44` }}>
+        <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full" style={{ background: color, color: "#0B121D" }}>
+          <Icon size={big ? 24 : 20} />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className={`font-display ${big ? "text-lg" : "text-base"}`}>{celebration.title}</p>
+          <p className="mt-1 text-xs" style={{ color: COLORS.text }}>{celebration.text}</p>
+          <p className="mt-1.5 font-mono text-[10px]" style={{ color }}>{celebration.progress}</p>
+        </div>
+        <button onClick={onClose} aria-label="Fechar"><X size={14} style={{ color: COLORS.sub }} /></button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
    MAIN APP
 ----------------------------------------------------------------*/
 export default function StudyPlanner() {
@@ -200,6 +437,8 @@ export default function StudyPlanner() {
   const [agenda, setAgenda] = useState([]);
   const [decks, setDecks] = useState([]);
   const [pomoSettings, setPomoSettings] = useState({ work: 25, short: 5, long: 15, cyclesUntilLong: 4 });
+  const [celebration, setCelebration] = useState(null);
+  const pomo = usePomodoro(pomoSettings);
 
   useEffect(() => {
     (async () => {
@@ -274,16 +513,20 @@ export default function StudyPlanner() {
 
       <main className="px-3 sm:px-6 py-5 max-w-5xl mx-auto">
         {tab === "cronograma" && (
-          <Cronograma subjects={subjects} setSubjects={setSubjects} schedule={schedule} setSchedule={setSchedule} />
+          <Cronograma subjects={subjects} setSubjects={setSubjects} schedule={schedule} setSchedule={setSchedule} onCelebrate={setCelebration} />
         )}
         {tab === "agenda" && <Agenda agenda={agenda} setAgenda={setAgenda} />}
-        {tab === "pomodoro" && <Pomodoro settings={pomoSettings} setSettings={setPomoSettings} />}
+        {tab === "pomodoro" && <Pomodoro pomo={pomo} settings={pomoSettings} setSettings={setPomoSettings} />}
         {tab === "flashcards" && <Flashcards decks={decks} setDecks={setDecks} />}
         {tab === "questoes" && <Questoes />}
         {tab === "desempenho" && <Desempenho subjects={subjects} />}
         {tab === "dicas" && <Dicas />}
         {tab === "concursos" && <Concursos />}
       </main>
+
+      <PomodoroChip pomo={pomo} tab={tab} setTab={setTab} />
+      <CelebrationToast celebration={celebration} onClose={() => setCelebration(null)} />
+      <PomodoroAlert pomo={pomo} />
     </div>
   );
 }
@@ -395,7 +638,7 @@ function Select(props) {
 }
 
 /* ================= CRONOGRAMA ================= */
-function Cronograma({ subjects, setSubjects, schedule, setSchedule }) {
+function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate }) {
   const [activeDay, setActiveDay] = useState("seg");
   const [newSubj, setNewSubj] = useState({ name: "", priority: "media", difficulty: 3, subtopics: "" });
   const [newSlot, setNewSlot] = useState({ start: "19:00", end: "20:00" });
@@ -438,6 +681,19 @@ function Cronograma({ subjects, setSubjects, schedule, setSchedule }) {
     const slot = schedule[dayKey].find((s) => s.id === slotId);
     if (slot?.subjectId && slot?.subtopicId) {
       setSubjects((prev) => prev.map((s) => s.id === slot.subjectId ? { ...s, subtopics: s.subtopics.map((t) => t.id === slot.subtopicId ? { ...t, done: !slot.done } : t) } : s));
+      // Mensagem de incentivo: só quando a submatéria passa de pendente para concluída
+      if (!slot.done && onCelebrate) {
+        const subj = subjects.find((s) => s.id === slot.subjectId);
+        const sub = subj?.subtopics.find((t) => t.id === slot.subtopicId);
+        if (subj && sub && !sub.done) {
+          const total = subj.subtopics.length;
+          const done = subj.subtopics.filter((t) => t.done).length + 1;
+          onCelebrate(buildCelebration({
+            kind: done >= total ? "subject" : "sub",
+            subjectName: subj.name, subtopicName: sub.name, done, total,
+          }));
+        }
+      }
     }
   };
 
@@ -687,57 +943,25 @@ function Agenda({ agenda, setAgenda }) {
 }
 
 /* ================= POMODORO ================= */
-function Pomodoro({ settings, setSettings }) {
-  const [mode, setMode] = useState("work"); // work | short | long
-  const [secondsLeft, setSecondsLeft] = useState(settings.work * 60);
-  const [running, setRunning] = useState(false);
-  const [cycles, setCycles] = useState(0);
-  const intervalRef = useRef(null);
+function Pomodoro({ pomo, settings, setSettings }) {
+  const { state } = pomo;
+  const mode = state.mode;
+  const [perm, setPerm] = useState(notifSupported() ? Notification.permission : "unsupported");
 
-  useEffect(() => { if (!running) setSecondsLeft(settings[mode === "work" ? "work" : mode] * 60); }, [settings, mode]); // eslint-disable-line
-
-  useEffect(() => {
-    if (running) {
-      intervalRef.current = setInterval(() => {
-        setSecondsLeft((s) => {
-          if (s <= 1) {
-            clearInterval(intervalRef.current);
-            playChime();
-            setRunning(false);
-            if (mode === "work") {
-              const nextCycles = cycles + 1;
-              setCycles(nextCycles);
-              const nextMode = nextCycles % settings.cyclesUntilLong === 0 ? "long" : "short";
-              setMode(nextMode);
-              return settings[nextMode] * 60;
-            } else {
-              setMode("work");
-              return settings.work * 60;
-            }
-          }
-          return s - 1;
-        });
-      }, 1000);
-    }
-    return () => clearInterval(intervalRef.current);
-  }, [running]); // eslint-disable-line
-
-  const total = settings[mode] * 60;
-  const pct = Math.max(0, Math.min(100, ((total - secondsLeft) / total) * 100));
-  const mm = String(Math.floor(secondsLeft / 60)).padStart(2, "0");
-  const ss = String(secondsLeft % 60).padStart(2, "0");
+  const totalMs = settings[mode] * 60000;
+  const remaining = pomoRemainingMs(state, pomo.now);
+  const pct = Math.max(0, Math.min(100, ((totalMs - remaining) / totalMs) * 100));
   const modeLabel = { work: "Foco", short: "Pausa curta", long: "Pausa longa" }[mode];
   const modeColor = { work: COLORS.rose, short: COLORS.teal, long: COLORS.gold }[mode];
 
-  const reset = () => { setRunning(false); setSecondsLeft(settings[mode] * 60); };
-  const switchMode = (m) => { setRunning(false); setMode(m); setSecondsLeft(settings[m] * 60); };
+  const askPerm = async () => { setPerm(await requestNotifPermission()); };
 
   return (
     <div className="space-y-5">
       <Card className="flex flex-col items-center py-8">
         <div className="flex gap-2 mb-6">
           {["work", "short", "long"].map((m) => (
-            <button key={m} onClick={() => switchMode(m)} className="px-3 py-1 rounded-full text-xs font-medium"
+            <button key={m} onClick={() => pomo.switchMode(m)} className="px-3 py-1 rounded-full text-xs font-medium"
               style={{ background: mode === m ? modeColor : "transparent", color: mode === m ? "#0B121D" : COLORS.sub, border: `1px solid ${mode===m?modeColor:COLORS.cardBorder}` }}>
               {{ work: "Foco", short: "Pausa curta", long: "Pausa longa" }[m]}
             </button>
@@ -752,19 +976,38 @@ function Pomodoro({ settings, setSettings }) {
               strokeDasharray={2 * Math.PI * 44} strokeDashoffset={2 * Math.PI * 44 * (1 - pct / 100)} style={{ transition: "stroke-dashoffset 1s linear" }} />
           </svg>
           <div className="rounded-full border-2 border-dashed w-44 h-44 flex flex-col items-center justify-center" style={{ borderColor: modeColor + "77" }}>
-            <span className="font-mono text-4xl">{mm}:{ss}</span>
+            <span className="font-mono text-4xl">{formatClock(remaining)}</span>
             <span className="text-[10px] uppercase tracking-widest mt-1" style={{ color: modeColor }}>{modeLabel}</span>
           </div>
         </div>
 
         <div className="flex items-center gap-3 mt-6">
-          <Btn onClick={() => setRunning((r) => !r)}>{running ? <Pause size={15} /> : <Play size={15} />} {running ? "Pausar" : "Iniciar"}</Btn>
-          <Btn onClick={reset} variant="ghost"><RotateCcw size={15} /> Reiniciar</Btn>
+          <Btn onClick={state.running ? pomo.pause : pomo.start}>{state.running ? <Pause size={15} /> : <Play size={15} />} {state.running ? "Pausar" : "Iniciar"}</Btn>
+          <Btn onClick={pomo.reset} variant="ghost"><RotateCcw size={15} /> Reiniciar</Btn>
         </div>
         <div className="flex items-center gap-1.5 mt-3 text-xs" style={{ color: COLORS.sub }}>
-          <Flame size={13} style={{ color: COLORS.gold }} /> {cycles} ciclo(s) de foco concluído(s) hoje
+          <Flame size={13} style={{ color: COLORS.gold }} /> {state.cycles} ciclo(s) de foco concluído(s) hoje
         </div>
-        <div className="flex items-center gap-1 mt-1 text-[11px]" style={{ color: COLORS.sub }}><Volume2 size={11} /> Som suave ao concluir o tempo</div>
+        <p className="mt-1 max-w-xs text-center text-[11px]" style={{ color: COLORS.sub }}>
+          Ao fim do foco o descanso começa sozinho, e você é avisado quando ele acabar.
+        </p>
+      </Card>
+
+      <Card>
+        <SectionTitle icon={BellRing}>Alertas</SectionTitle>
+        <p className="text-xs mb-3" style={{ color: COLORS.sub }}>
+          No fim de cada etapa o app mostra um aviso em tela cheia, toca um som, vibra (no celular) e envia uma notificação do sistema, que aparece por cima de outros apps.
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          {perm === "default" && <Btn onClick={askPerm} small><Bell size={13} /> Ativar notificações do sistema</Btn>}
+          {perm === "granted" && <span className="text-xs" style={{ color: COLORS.teal }}>Notificações do sistema ativadas</span>}
+          {perm === "denied" && <span className="text-xs" style={{ color: COLORS.rose }}>Notificações bloqueadas: libere nas configurações do site/app no navegador.</span>}
+          {perm === "unsupported" && <span className="text-xs" style={{ color: COLORS.sub }}>Este navegador não oferece notificações do sistema.</span>}
+          <Btn onClick={pomo.testAlert} variant="ghost" small><Volume2 size={13} /> Testar alerta</Btn>
+        </div>
+        <p className="text-[11px] mt-3" style={{ color: COLORS.sub }}>
+          Dica: deixe o app aberto enquanto estuda. Enquanto o timer roda, o app pede para a tela não apagar; se o sistema suspender o navegador em segundo plano, o aviso pode chegar com atraso.
+        </p>
       </Card>
 
       <Card>
@@ -869,7 +1112,133 @@ function Flashcards({ decks, setDecks }) {
           )}
         </>
       )}
+
+      <AnkiPanel decks={decks} setDecks={setDecks} activeDeck={activeDeck} />
     </div>
+  );
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function AnkiPanel({ decks, setDecks, activeDeck }) {
+  const [scope, setScope] = useState("all");
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const fileRef = useRef(null);
+
+  const useCurrent = scope === "current" && !!activeDeck;
+  const target = useCurrent ? [activeDeck] : decks;
+  const totalCards = target.reduce((n, d) => n + d.cards.length, 0);
+  const stamp = new Date().toISOString().slice(0, 10);
+  const baseName = useCurrent
+    ? activeDeck.name.replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/^-+|-+$/g, "") || "baralho"
+    : "todos-os-baralhos";
+
+  const exportTxt = () => {
+    if (!totalCards) { setStatus({ type: "err", text: "Não há cartões para exportar." }); return; }
+    const text = buildAnkiText(target, { includeDeckColumn: !useCurrent });
+    downloadBlob(new Blob([text], { type: "text/plain;charset=utf-8" }), `anki-${baseName}-${stamp}.txt`);
+    setStatus({ type: "ok", text: `${totalCards} cartão(ões) exportado(s) em texto. No Anki: Arquivo > Importar.` });
+  };
+
+  const exportApkg = async () => {
+    if (!totalCards) { setStatus({ type: "err", text: "Não há cartões para exportar." }); return; }
+    setBusy(true); setStatus(null);
+    try {
+      const blob = await buildApkgBlob(target.filter((d) => d.cards.length));
+      downloadBlob(blob, `anki-${baseName}-${stamp}.apkg`);
+      setStatus({ type: "ok", text: `${totalCards} cartão(ões) exportado(s) em .apkg. Abra o arquivo com o Anki (ou Arquivo > Importar).` });
+    } catch (e) {
+      setStatus({ type: "err", text: e.message || "Não foi possível gerar o .apkg." });
+    } finally { setBusy(false); }
+  };
+
+  const finishImport = (cards, skipped, extra = "") => {
+    if (!cards.length) { setStatus({ type: "err", text: "Nenhum cartão válido encontrado no arquivo." + extra }); return; }
+    const merged = mergeImportedCards(decks, cards, uid);
+    setDecks(merged.decks);
+    const parts = [`${merged.added} cartão(ões) importado(s) em ${merged.deckCount} baralho(s)`];
+    if (merged.dup) parts.push(`${merged.dup} repetido(s) ignorado(s)`);
+    if (skipped) parts.push(`${skipped} sem frente/verso ignorado(s)`);
+    setStatus({ type: "ok", text: parts.join(" · ") + "." + extra });
+  };
+
+  const onFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy(true); setStatus(null);
+    try {
+      if (/\.(apkg|colpkg)$/i.test(file.name)) {
+        const r = await parseApkgFile(file);
+        finishImport(r.cards, r.skipped, " Imagens e áudios não são importados.");
+      } else {
+        const text = await file.text();
+        const r = parseAnkiText(text, { defaultDeck: activeDeck?.name || file.name.replace(/\.[^.]+$/, "") });
+        if (r.error) setStatus({ type: "err", text: r.error });
+        else finishImport(r.cards, r.skipped);
+      }
+    } catch (err) {
+      setStatus({ type: "err", text: err.message || "Falha ao importar o arquivo." });
+    } finally { setBusy(false); }
+  };
+
+  const importPasted = () => {
+    if (!pasteText.trim()) return;
+    const r = parseAnkiText(pasteText, { defaultDeck: activeDeck?.name || "Importados" });
+    if (r.error) { setStatus({ type: "err", text: r.error }); return; }
+    finishImport(r.cards, r.skipped);
+    if (r.cards.length) setPasteText("");
+  };
+
+  return (
+    <Card>
+      <SectionTitle icon={Download}>Importar e exportar (Anki)</SectionTitle>
+
+      <p className="text-xs mb-2" style={{ color: COLORS.sub }}>Exportar</p>
+      <div className="flex flex-wrap items-center gap-2 mb-1">
+        <Select value={useCurrent ? "current" : "all"} onChange={(e) => setScope(e.target.value)}>
+          <option value="all">Todos os baralhos</option>
+          <option value="current" disabled={!activeDeck}>Baralho selecionado{activeDeck ? ` (${activeDeck.name})` : ""}</option>
+        </Select>
+        <Btn onClick={exportTxt} small variant="ghost"><Download size={13} /> Texto (.txt)</Btn>
+        <Btn onClick={exportApkg} small><Download size={13} /> Pacote Anki (.apkg)</Btn>
+      </div>
+      <p className="text-[11px] mb-4" style={{ color: COLORS.sub }}>
+        O .txt traz o nome do baralho em cada linha (ao exportar todos) e o .apkg já cria os baralhos no Anki. Cartões novos, sem histórico de revisão.
+      </p>
+
+      <p className="text-xs mb-2" style={{ color: COLORS.sub }}>Importar</p>
+      <div className="flex flex-wrap items-center gap-2 mb-1">
+        <Btn onClick={() => fileRef.current?.click()} small><Upload size={13} /> Escolher arquivo</Btn>
+        <input ref={fileRef} type="file" accept=".txt,.csv,.tsv,.apkg,.colpkg,text/plain,text/csv" className="hidden" onChange={onFile} />
+        {busy && <span className="text-xs animate-pulse" style={{ color: COLORS.sub }}>Processando…</span>}
+      </div>
+      <p className="text-[11px] mb-3" style={{ color: COLORS.sub }}>
+        Aceita .apkg e .colpkg (baralhos completos) e texto/CSV/TSV exportados do Anki ou de planilhas (frente na 1ª coluna, verso na 2ª). Cartões repetidos são ignorados. Se for texto sem nome de baralho, vai para o baralho selecionado (ou para um novo com o nome do arquivo).
+      </p>
+
+      <p className="text-xs mb-2" style={{ color: COLORS.sub }}>Colar vários cartões de uma vez</p>
+      <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)} rows={4}
+        placeholder={"Uma linha por cartão: frente ; verso\nQual a capital do Brasil? ; Brasília"}
+        className="w-full rounded-lg px-3 py-2 text-sm outline-none border"
+        style={{ background: COLORS.bg2, borderColor: COLORS.cardBorder, color: COLORS.text }} />
+      <Btn onClick={importPasted} small className="mt-2"><Plus size={13} /> Importar texto colado</Btn>
+
+      {status && (
+        <p className="text-xs mt-3" style={{ color: status.type === "ok" ? COLORS.teal : COLORS.rose }}>{status.text}</p>
+      )}
+    </Card>
   );
 }
 
