@@ -1,9 +1,9 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   Plus, Trash2, Check, X, Clock, Calendar as CalendarIcon, Play, Pause,
   RotateCcw, BookOpen, Brain, BarChart3, Lightbulb, Newspaper, Bell,
   ChevronLeft, ChevronRight, Shuffle, Flame, Star, CircleDot, Sparkles,
-  Volume2, Award, Layers, ClipboardList, Wand2, Download, Upload, BellRing, Coffee, Trophy
+  Volume2, Award, Layers, ClipboardList, Wand2, Download, Upload, BellRing, Coffee, Trophy, Pencil, Hourglass
 } from "lucide-react";
 import {
   RadialBarChart, RadialBar, PolarAngleAxis, ResponsiveContainer, Legend
@@ -12,6 +12,7 @@ import {
   makePomoState, pomoRemainingMs, pomoStart, pomoPause, pomoSwitch, pomoReset, pomoAdvance, formatClock,
 } from "./pomodoroLogic.js";
 import { buildCelebration } from "./encouragement.js";
+import { estimateCompletion, examInfo, subtopicHours, MAX_DAYS } from "./estimate.js";
 import {
   parseAnkiText, buildAnkiText, buildApkgBlob, parseApkgFile, mergeImportedCards,
 } from "./anki.js";
@@ -90,7 +91,7 @@ const seedSubjects = () => [
    STORAGE HELPERS
 ----------------------------------------------------------------*/
 const STORAGE_PREFIX = "plano-estudos:";
-const DATA_KEYS = ["subjects", "schedule", "agenda", "decks", "pomo-settings", "concursos"];
+const DATA_KEYS = ["subjects", "schedule", "agenda", "decks", "pomo-settings", "plan-settings", "concursos"];
 
 async function loadKey(key, fallback) {
   try {
@@ -244,6 +245,26 @@ function weightedRoundRobinPick(subjects, count) {
     seq.push(best.id);
   }
   return seq;
+}
+
+/* ---------------------------------------------------------------
+   FORMATAÇÃO DAS ESTIMATIVAS
+----------------------------------------------------------------*/
+const fmtDate = (d) => (d ? d.toLocaleDateString("pt-BR") : "");
+const fmtH = (x) => `${Number(x).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} h`;
+function fmtSpan(days) {
+  if (days === 1) return "1 dia";
+  if (days < 14) return `${days} dias`;
+  if (days < 60) return `${days} dias (~${Math.round(days / 7)} semanas)`;
+  return `${days} dias (~${Math.round(days / 30.4)} meses)`;
+}
+// Texto curto do estado de cada matéria/geral
+function estimateLabel(est, noCapacity, over) {
+  if (!est) return "";
+  if (est.days === 0) return "Concluída";
+  if (noCapacity) return "Sem horários";
+  if (over || est.days == null) return `+${Math.round(MAX_DAYS / 365)} anos`;
+  return `≈ ${fmtSpan(est.days)}`;
 }
 
 /* ---------------------------------------------------------------
@@ -437,23 +458,26 @@ export default function StudyPlanner() {
   const [agenda, setAgenda] = useState([]);
   const [decks, setDecks] = useState([]);
   const [pomoSettings, setPomoSettings] = useState({ work: 25, short: 5, long: 15, cyclesUntilLong: 4 });
+  const [planSettings, setPlanSettings] = useState({ defaultHours: 2 });
   const [celebration, setCelebration] = useState(null);
   const pomo = usePomodoro(pomoSettings);
 
   useEffect(() => {
     (async () => {
-      const [s, sc, ag, dk, ps] = await Promise.all([
+      const [s, sc, ag, dk, ps, pl] = await Promise.all([
         loadKey("subjects", null),
         loadKey("schedule", null),
         loadKey("agenda", []),
         loadKey("decks", []),
         loadKey("pomo-settings", null),
+        loadKey("plan-settings", null),
       ]);
       setSubjects(s || seedSubjects());
       setSchedule(sc || (() => { const o = {}; DAYS.forEach((d) => (o[d.key] = [])); return o; })());
       setAgenda(ag || []);
       setDecks(dk || []);
       setPomoSettings(ps || { work: 25, short: 5, long: 15, cyclesUntilLong: 4 });
+      setPlanSettings(pl || { defaultHours: 2 });
       setLoaded(true);
     })();
   }, []);
@@ -463,6 +487,17 @@ export default function StudyPlanner() {
   useEffect(() => { if (loaded) saveKey("agenda", agenda); }, [agenda, loaded]);
   useEffect(() => { if (loaded) saveKey("decks", decks); }, [decks, loaded]);
   useEffect(() => { if (loaded) saveKey("pomo-settings", pomoSettings); }, [pomoSettings, loaded]);
+  useEffect(() => { if (loaded) saveKey("plan-settings", planSettings); }, [planSettings, loaded]);
+
+  // Estimativa de dias para concluir (geral e por matéria) + comparação com a prova
+  const estimate = useMemo(
+    () => estimateCompletion({ subjects, schedule, defaultHours: planSettings.defaultHours }),
+    [subjects, schedule, planSettings.defaultHours]
+  );
+  const exam = useMemo(
+    () => examInfo({ agenda, overallDays: estimate.overall.days, totalPending: estimate.totalPending, weeklyHours: estimate.weeklyHours }),
+    [agenda, estimate]
+  );
 
   const tabs = [
     { key: "cronograma", label: "Cronograma", icon: ClipboardList },
@@ -513,13 +548,14 @@ export default function StudyPlanner() {
 
       <main className="px-3 sm:px-6 py-5 max-w-5xl mx-auto">
         {tab === "cronograma" && (
-          <Cronograma subjects={subjects} setSubjects={setSubjects} schedule={schedule} setSchedule={setSchedule} onCelebrate={setCelebration} />
+          <Cronograma subjects={subjects} setSubjects={setSubjects} schedule={schedule} setSchedule={setSchedule} onCelebrate={setCelebration}
+            estimate={estimate} planSettings={planSettings} setPlanSettings={setPlanSettings} />
         )}
         {tab === "agenda" && <Agenda agenda={agenda} setAgenda={setAgenda} />}
         {tab === "pomodoro" && <Pomodoro pomo={pomo} settings={pomoSettings} setSettings={setPomoSettings} />}
         {tab === "flashcards" && <Flashcards decks={decks} setDecks={setDecks} />}
         {tab === "questoes" && <Questoes />}
-        {tab === "desempenho" && <Desempenho subjects={subjects} />}
+        {tab === "desempenho" && <Desempenho subjects={subjects} estimate={estimate} exam={exam} planSettings={planSettings} />}
         {tab === "dicas" && <Dicas />}
         {tab === "concursos" && <Concursos />}
       </main>
@@ -638,8 +674,10 @@ function Select(props) {
 }
 
 /* ================= CRONOGRAMA ================= */
-function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate }) {
+function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate, estimate, planSettings, setPlanSettings }) {
   const [activeDay, setActiveDay] = useState("seg");
+  const [editingId, setEditingId] = useState(null);
+  const [newSubtopic, setNewSubtopic] = useState("");
   const [newSubj, setNewSubj] = useState({ name: "", priority: "media", difficulty: 3, subtopics: "" });
   const [newSlot, setNewSlot] = useState({ start: "19:00", end: "20:00" });
   const [showAddSubject, setShowAddSubject] = useState(false);
@@ -658,6 +696,47 @@ function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate 
       Object.entries(prev).forEach(([k, arr]) => { next[k] = arr.map((sl) => (sl.subjectId === id ? { ...sl, subjectId: null, subtopicId: null } : sl)); });
       return next;
     });
+  };
+
+  /* ---- edição de matérias e submatérias ---- */
+  const updateSubject = (id, patch) => setSubjects((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  const updateSubtopic = (subjectId, subtopicId, patch) =>
+    setSubjects((prev) => prev.map((s) => (s.id === subjectId
+      ? { ...s, subtopics: s.subtopics.map((t) => (t.id === subtopicId ? { ...t, ...patch } : t)) } : s)));
+  const addSubtopic = (subjectId) => {
+    const name = newSubtopic.trim();
+    if (!name) return;
+    setSubjects((prev) => prev.map((s) => (s.id === subjectId ? { ...s, subtopics: [...s.subtopics, { id: uid(), name, done: false }] } : s)));
+    setNewSubtopic("");
+  };
+  const removeSubtopic = (subjectId, subtopicId) => {
+    const subj = subjects.find((s) => s.id === subjectId);
+    if (!subj || subj.subtopics.length <= 1) return;
+    const remaining = subj.subtopics.filter((t) => t.id !== subtopicId);
+    const fallback = remaining.find((t) => !t.done) || remaining[0];
+    setSubjects((prev) => prev.map((s) => (s.id === subjectId ? { ...s, subtopics: remaining } : s)));
+    // horários que apontavam para a submatéria apagada passam para outra da mesma matéria
+    setSchedule((prev) => {
+      const next = {};
+      Object.entries(prev).forEach(([k, arr]) => {
+        next[k] = arr.map((sl) => (sl.subtopicId === subtopicId ? { ...sl, subtopicId: fallback.id, done: false } : sl));
+      });
+      return next;
+    });
+  };
+  const setSubtopicDone = (subjectId, subtopicId, done) => {
+    const subj = subjects.find((s) => s.id === subjectId);
+    const sub = subj?.subtopics.find((t) => t.id === subtopicId);
+    if (!subj || !sub) return;
+    updateSubtopic(subjectId, subtopicId, { done });
+    if (done && !sub.done && onCelebrate) {
+      const total = subj.subtopics.length;
+      const doneCount = subj.subtopics.filter((t) => t.done).length + 1;
+      onCelebrate(buildCelebration({
+        kind: doneCount >= total ? "subject" : "sub",
+        subjectName: subj.name, subtopicName: sub.name, done: doneCount, total,
+      }));
+    }
   };
 
   const addSlot = () => {
@@ -766,6 +845,16 @@ function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate 
           <SectionTitle icon={BookOpen}>Matérias</SectionTitle>
           <Btn onClick={() => setShowAddSubject((v) => !v)} variant="ghost" small><Plus size={13} /> Matéria</Btn>
         </div>
+        <div className="flex flex-wrap items-center gap-2 mb-3 text-xs" style={{ color: COLORS.sub }}>
+          <Hourglass size={13} style={{ color: COLORS.gold }} />
+          <span>Horas por submatéria (padrão):</span>
+          <Input type="number" min={0.5} step={0.5} className="w-20" value={planSettings.defaultHours}
+            onChange={(e) => setPlanSettings({ ...planSettings, defaultHours: Math.max(0.5, Number(e.target.value) || 0.5) })} />
+          <span className="font-mono" style={{ color: COLORS.gold }}>
+            Previsão geral: {estimate.noCapacity ? "cadastre horários abaixo" : estimateLabel(estimate.overall, estimate.noCapacity, estimate.over)}
+            {estimate.overall.date && estimate.overall.days > 0 ? ` · até ${fmtDate(estimate.overall.date)}` : ""}
+          </span>
+        </div>
         {showAddSubject && (
           <div className="grid sm:grid-cols-2 gap-2 mb-3 p-3 rounded-lg" style={{ background: COLORS.bg2 }}>
             <Input placeholder="Nome da matéria" value={newSubj.name} onChange={(e) => setNewSubj({ ...newSubj, name: e.target.value })} />
@@ -784,12 +873,79 @@ function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate 
         <div className="space-y-1.5">
           {subjects.map((s) => {
             const doneCount = s.subtopics.filter((t) => t.done).length;
+            const isEditing = editingId === s.id;
+            const est = estimate.perSubject[s.id];
             return (
-              <div key={s.id} className="flex items-center gap-2 px-3 py-2 rounded-lg" style={{ background: COLORS.bg2 }}>
-                <span className="w-2 h-2 rounded-full shrink-0" style={{ background: PRIORITY[s.priority].color }} />
-                <span className="text-sm flex-1 truncate">{s.name}</span>
-                <span className="text-[10px] font-mono" style={{ color: COLORS.sub }}>{doneCount}/{s.subtopics.length} · dif. {s.difficulty}</span>
-                <button onClick={() => removeSubject(s.id)}><Trash2 size={14} style={{ color: COLORS.rose }} /></button>
+              <div key={s.id} className="rounded-lg" style={{ background: COLORS.bg2 }}>
+                <div className="flex items-center gap-2 px-3 py-2">
+                  <span className="w-2 h-2 rounded-full shrink-0" style={{ background: PRIORITY[s.priority].color }} />
+                  <span className="text-sm flex-1 truncate">{s.name || "(sem nome)"}</span>
+                  <span className="text-[10px] font-mono" style={{ color: COLORS.sub }}>{doneCount}/{s.subtopics.length} · dif. {s.difficulty}</span>
+                  {est && !estimate.noCapacity && (
+                    <span className="hidden sm:inline text-[10px] font-mono" style={{ color: COLORS.gold }}>{estimateLabel(est, estimate.noCapacity, estimate.over)}</span>
+                  )}
+                  <button onClick={() => { setEditingId(isEditing ? null : s.id); setNewSubtopic(""); }} aria-label={`Editar ${s.name}`} title="Editar matéria e submatérias">
+                    <Pencil size={14} style={{ color: isEditing ? COLORS.gold : COLORS.sub }} />
+                  </button>
+                  <button onClick={() => { if (window.confirm(`Excluir "${s.name}" e todas as suas submatérias?`)) removeSubject(s.id); }} aria-label={`Excluir ${s.name}`} title="Excluir matéria">
+                    <Trash2 size={14} style={{ color: COLORS.rose }} />
+                  </button>
+                </div>
+
+                {isEditing && (
+                  <div className="border-t px-3 py-3 space-y-3" style={{ borderColor: COLORS.cardBorder }}>
+                    <div className="grid sm:grid-cols-2 gap-2">
+                      <label className="text-[11px] sm:col-span-2" style={{ color: COLORS.sub }}>
+                        Nome da matéria
+                        <Input className="w-full mt-1" value={s.name} onChange={(e) => updateSubject(s.id, { name: e.target.value })} />
+                      </label>
+                      <label className="text-[11px]" style={{ color: COLORS.sub }}>
+                        Prioridade
+                        <Select className="w-full mt-1" value={s.priority} onChange={(e) => updateSubject(s.id, { priority: e.target.value })}>
+                          {Object.entries(PRIORITY).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                        </Select>
+                      </label>
+                      <label className="text-[11px]" style={{ color: COLORS.sub }}>
+                        Dificuldade: <span className="font-mono">{s.difficulty}</span>
+                        <input type="range" min={1} max={5} value={s.difficulty} className="w-full mt-3"
+                          onChange={(e) => updateSubject(s.id, { difficulty: Number(e.target.value) })} />
+                      </label>
+                    </div>
+
+                    <div>
+                      <p className="text-[11px] mb-1.5" style={{ color: COLORS.sub }}>
+                        Submatérias (marque as concluídas · horas estimadas de estudo, vazio = padrão de {fmtH(planSettings.defaultHours)})
+                      </p>
+                      <div className="space-y-1.5">
+                        {s.subtopics.map((t) => (
+                          <div key={t.id} className="flex items-center gap-2">
+                            <button onClick={() => setSubtopicDone(s.id, t.id, !t.done)} aria-label={t.done ? "Desmarcar como concluída" : "Marcar como concluída"}
+                              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border"
+                              style={{ background: t.done ? COLORS.teal : "transparent", borderColor: t.done ? COLORS.teal : COLORS.cardBorder, color: "#0B121D" }}>
+                              {t.done && <Check size={13} />}
+                            </button>
+                            <Input className="flex-1 min-w-0" value={t.name} placeholder="Nome da submatéria"
+                              onChange={(e) => updateSubtopic(s.id, t.id, { name: e.target.value })} />
+                            <Input type="number" min={0.5} step={0.5} className="w-20" title="Horas estimadas"
+                              placeholder={String(planSettings.defaultHours)} value={t.hours ?? ""}
+                              onChange={(e) => updateSubtopic(s.id, t.id, { hours: e.target.value === "" ? undefined : Number(e.target.value) })} />
+                            <button onClick={() => removeSubtopic(s.id, t.id)} disabled={s.subtopics.length <= 1}
+                              aria-label="Excluir submatéria" title={s.subtopics.length <= 1 ? "A matéria precisa ter ao menos uma submatéria" : "Excluir submatéria"}
+                              style={{ opacity: s.subtopics.length <= 1 ? 0.3 : 1 }}>
+                              <Trash2 size={13} style={{ color: COLORS.rose }} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="flex gap-2 mt-2">
+                        <Input className="flex-1 min-w-0" placeholder="Nova submatéria" value={newSubtopic}
+                          onChange={(e) => setNewSubtopic(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addSubtopic(s.id); }} />
+                        <Btn onClick={() => addSubtopic(s.id)} small variant="ghost"><Plus size={13} /> Adicionar</Btn>
+                      </div>
+                    </div>
+                    <Btn onClick={() => setEditingId(null)} small><Check size={13} /> Concluir edição</Btn>
+                  </div>
+                )}
               </div>
             );
           })}
@@ -1324,12 +1480,12 @@ function Questoes() {
 }
 
 /* ================= DESEMPENHO ================= */
-function Desempenho({ subjects }) {
+function Desempenho({ subjects, estimate, exam, planSettings }) {
   const data = subjects.map((s) => {
     const total = s.subtopics.length || 1;
     const done = s.subtopics.filter((t) => t.done).length;
     const pct = Math.round((done / total) * 100);
-    return { name: s.name, pct, fill: PRIORITY[s.priority].color, priority: s.priority, done, total };
+    return { id: s.id, name: s.name || "(sem nome)", pct, fill: PRIORITY[s.priority].color, priority: s.priority, done, total };
   });
 
   const commentFor = (pct) => {
@@ -1339,30 +1495,86 @@ function Desempenho({ subjects }) {
     return "Atenção: praticamente sem avanço — priorize no cronograma.";
   };
 
+  const overall = estimate.overall;
+  const finished = overall.days === 0;
+  let headline;
+  if (!subjects.length) headline = "Cadastre matérias para calcular";
+  else if (finished) headline = "Tudo concluído!";
+  else if (estimate.noCapacity) headline = "Cadastre horários no cronograma semanal";
+  else if (estimate.over || overall.days == null) headline = `Mais de ${Math.round(MAX_DAYS / 365)} anos`;
+  else headline = fmtSpan(overall.days);
+
+  let examMsg = null;
+  if (exam && !finished && !estimate.noCapacity) {
+    const when = `${fmtDate(exam.date)} (em ${exam.daysToExam} ${exam.daysToExam === 1 ? "dia" : "dias"})`;
+    if (exam.marginDays == null) {
+      examMsg = { ok: false, text: `Prova em ${when}. No ritmo atual você não termina o conteúdo a tempo.` };
+    } else if (exam.marginDays >= 0) {
+      examMsg = { ok: true, text: `Prova em ${when}. Pelo ritmo atual você termina ${exam.marginDays} ${exam.marginDays === 1 ? "dia" : "dias"} antes, sobrando tempo para revisão.` };
+    } else {
+      const need = exam.neededWeeklyHours != null ? ` Para terminar até a prova seriam necessárias cerca de ${fmtH(exam.neededWeeklyHours)} por semana (hoje: ${fmtH(estimate.weeklyHours)}).` : "";
+      examMsg = { ok: false, text: `Prova em ${when}. No ritmo atual você termina ${-exam.marginDays} ${-exam.marginDays === 1 ? "dia" : "dias"} depois dela.${need}` };
+    }
+  } else if (exam && finished) {
+    examMsg = { ok: true, text: `Prova em ${fmtDate(exam.date)} (em ${exam.daysToExam} ${exam.daysToExam === 1 ? "dia" : "dias"}). Conteúdo concluído: foque em revisão e questões.` };
+  }
+
   return (
     <div className="space-y-5">
+      <Card>
+        <SectionTitle icon={Hourglass}>Estimativa para concluir os estudos</SectionTitle>
+        <div className="flex flex-wrap items-end gap-x-6 gap-y-2">
+          <div>
+            <div className="font-display text-3xl" style={{ color: COLORS.gold }}>{headline}</div>
+            {overall.date && overall.days > 0 && (
+              <div className="text-xs font-mono" style={{ color: COLORS.sub }}>término previsto em {fmtDate(overall.date)}</div>
+            )}
+          </div>
+          <div className="flex gap-5 text-xs" style={{ color: COLORS.sub }}>
+            <div><div className="font-mono text-sm" style={{ color: COLORS.text }}>{fmtH(estimate.totalPending)}</div>pendentes</div>
+            <div><div className="font-mono text-sm" style={{ color: COLORS.text }}>{fmtH(estimate.weeklyHours)}</div>por semana</div>
+          </div>
+        </div>
+        {examMsg && (
+          <p className="text-xs mt-3" style={{ color: examMsg.ok ? COLORS.teal : COLORS.rose }}>{examMsg.text}</p>
+        )}
+        <p className="text-[11px] mt-3" style={{ color: COLORS.sub }}>
+          Como é calculado: horas pendentes das submatérias (padrão de {fmtH(planSettings.defaultHours)} cada, ajustável na edição da matéria) divididas pelas horas dos seus horários semanais, contando a partir de hoje. As horas de cada dia são repartidas entre as matérias por prioridade × dificuldade, e quando uma termina as horas dela passam para as outras.
+        </p>
+      </Card>
+
       <Card>
         <SectionTitle icon={BarChart3}>Desempenho por matéria</SectionTitle>
         {!data.length && <p className="text-xs" style={{ color: COLORS.sub }}>Cadastre matérias no Cronograma para ver seu desempenho.</p>}
         <div className="grid sm:grid-cols-2 gap-4">
-          {data.map((d) => (
-            <div key={d.name} className="rounded-lg p-3" style={{ background: COLORS.bg2 }}>
-              <div style={{ width: "100%", height: 160 }}>
-                <ResponsiveContainer>
-                  <RadialBarChart innerRadius="65%" outerRadius="100%" data={[d]} startAngle={90} endAngle={-270}>
-                    <PolarAngleAxis type="number" domain={[0, 100]} angleAxisId={0} tick={false} />
-                    <RadialBar background={{ fill: COLORS.cardBorder }} dataKey="pct" cornerRadius={8} fill={d.fill} />
-                  </RadialBarChart>
-                </ResponsiveContainer>
+          {data.map((d) => {
+            const est = estimate.perSubject[d.id];
+            return (
+              <div key={d.id} className="rounded-lg p-3" style={{ background: COLORS.bg2 }}>
+                <div style={{ width: "100%", height: 160 }}>
+                  <ResponsiveContainer>
+                    <RadialBarChart innerRadius="65%" outerRadius="100%" data={[d]} startAngle={90} endAngle={-270}>
+                      <PolarAngleAxis type="number" domain={[0, 100]} angleAxisId={0} tick={false} />
+                      <RadialBar background={{ fill: COLORS.cardBorder }} dataKey="pct" cornerRadius={8} fill={d.fill} />
+                    </RadialBarChart>
+                  </ResponsiveContainer>
+                </div>
+                <div className="text-center -mt-24 mb-16">
+                  <span className="font-display text-2xl">{d.pct}%</span>
+                </div>
+                <p className="text-sm font-medium text-center">{d.name}</p>
+                <p className="text-[11px] text-center font-mono" style={{ color: COLORS.sub }}>{d.done}/{d.total} subtemas concluídos</p>
+                {est && (
+                  <p className="text-[11px] text-center font-mono mt-1" style={{ color: COLORS.gold }}>
+                    {est.days === 0
+                      ? "Matéria concluída"
+                      : `Faltam ${fmtH(est.pendingHours)}${estimate.noCapacity ? "" : ` · ${estimateLabel(est, estimate.noCapacity, estimate.over)}${est.date ? ` (até ${fmtDate(est.date)})` : ""}`}`}
+                  </p>
+                )}
+                <p className="text-[11px] text-center mt-1.5" style={{ color: d.fill }}>{commentFor(d.pct)}</p>
               </div>
-              <div className="text-center -mt-24 mb-16">
-                <span className="font-display text-2xl">{d.pct}%</span>
-              </div>
-              <p className="text-sm font-medium text-center">{d.name}</p>
-              <p className="text-[11px] text-center font-mono" style={{ color: COLORS.sub }}>{d.done}/{d.total} subtemas concluídos</p>
-              <p className="text-[11px] text-center mt-1.5" style={{ color: d.fill }}>{commentFor(d.pct)}</p>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </Card>
     </div>

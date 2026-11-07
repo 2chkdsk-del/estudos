@@ -68,6 +68,16 @@ npm run dev
 
 Abre em `http://localhost:5173`.
 
+## Matérias e estimativa de término
+
+- No Cronograma, o lápis ao lado de cada matéria abre a edição: nome,
+  prioridade, dificuldade e as submatérias (renomear, marcar como concluída,
+  definir horas de estudo, adicionar e excluir).
+- A estimativa de dias (geral e por matéria) aparece no Cronograma e na aba
+  Desempenho. Ela divide as horas pendentes pelas horas dos horários semanais
+  cadastrados, repartindo entre as matérias por prioridade x dificuldade. Se
+  houver uma prova na Agenda, o app compara com a data dela.
+
 ## Pomodoro: alertas
 
 - Ao terminar o foco, o app mostra um aviso em tela cheia, toca um som, vibra
