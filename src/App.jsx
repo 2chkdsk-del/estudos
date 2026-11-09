@@ -12,6 +12,11 @@ import {
   makePomoState, pomoRemainingMs, pomoStart, pomoPause, pomoSwitch, pomoReset, pomoAdvance, formatClock,
 } from "./pomodoroLogic.js";
 import { buildCelebration } from "./encouragement.js";
+import {
+  makeGamState, normalizeGam, award, GAM_STORAGE_KEY, reviewCard, isCardDue, todayISO,
+} from "./gamification.js";
+import { GamHeaderStrip, DailyGoalBar, RewardToast, AchievementsScreen } from "./GamificationUI.jsx";
+import { greeting, streakWarning, comebackMessage, narrativeForAction, goalHitMessage } from "./gamificationNarrative.js";
 import { estimateCompletion, examInfo, subtopicHours, MAX_DAYS } from "./estimate.js";
 import {
   parseAnkiText, buildAnkiText, buildApkgBlob, parseApkgFile, mergeImportedCards,
@@ -91,7 +96,7 @@ const seedSubjects = () => [
    STORAGE HELPERS
 ----------------------------------------------------------------*/
 const STORAGE_PREFIX = "plano-estudos:";
-const DATA_KEYS = ["subjects", "schedule", "agenda", "decks", "pomo-settings", "plan-settings", "concursos"];
+const DATA_KEYS = ["subjects", "schedule", "agenda", "decks", "pomo-settings", "plan-settings", "concursos", "gamification"];
 
 async function loadKey(key, fallback) {
   try {
@@ -270,22 +275,28 @@ function estimateLabel(est, noCapacity, over) {
 /* ---------------------------------------------------------------
    POMODORO — estado no topo do app (continua rodando em qualquer aba)
 ----------------------------------------------------------------*/
-function usePomodoro(settings) {
+function usePomodoro(settings, giveXP) {
   const [state, setState] = useState(() => makePomoState(settings));
   const [alertInfo, setAlertInfo] = useState(null);
   const [now, setNow] = useState(() => Date.now());
   const stateRef = useRef(state);
   const settingsRef = useRef(settings);
   const wakeRef = useRef(null);
+  const giveXPRef = useRef(giveXP);
   settingsRef.current = settings;
+  giveXPRef.current = giveXP;
 
   const apply = useCallback((ns) => { stateRef.current = ns; setState(ns); }, []);
 
   const tick = useCallback(() => {
     const t = Date.now();
     if (stateRef.current.running) setNow(Math.floor(t / 1000) * 1000);
+    const cyclesBefore = stateRef.current.cycles;
     const r = pomoAdvance(stateRef.current, t, settingsRef.current);
     if (r.changed) apply(r.state);
+    // XP por bloco de foco concluído (mesmo se o app ficou em segundo plano)
+    const blocks = r.state.cycles - cyclesBefore;
+    if (blocks > 0 && giveXPRef.current) for (let i = 0; i < blocks; i++) giveXPRef.current("pomodoroFocus");
     if (r.alert) { setAlertInfo(r.alert); fireAlert(r.alert); }
   }, [apply]);
 
@@ -445,6 +456,23 @@ function CelebrationToast({ celebration, onClose }) {
 }
 
 /* ---------------------------------------------------------------
+   GAMIFICAÇÃO — junta recompensas que chegam quase juntas (ex.: submatéria + matéria)
+----------------------------------------------------------------*/
+function mergeReward(prev, r, actionMsg) {
+  return {
+    gainedXP: prev.gainedXP + r.gainedXP,
+    levelUp: prev.levelUp || r.levelUp,
+    prevLevel: prev.prevLevel,
+    newLevel: r.newLevel,
+    newBadges: [...prev.newBadges, ...r.newBadges],
+    missionsDone: [...prev.missionsDone, ...r.missionsDone],
+    goalHit: prev.goalHit || r.goalHit,
+    actionMsg: prev.goalHit ? prev.actionMsg : actionMsg,
+    ts: Date.now(),
+  };
+}
+
+/* ---------------------------------------------------------------
    MAIN APP
 ----------------------------------------------------------------*/
 export default function StudyPlanner() {
@@ -460,17 +488,51 @@ export default function StudyPlanner() {
   const [pomoSettings, setPomoSettings] = useState({ work: 25, short: 5, long: 15, cyclesUntilLong: 4 });
   const [planSettings, setPlanSettings] = useState({ defaultHours: 2 });
   const [celebration, setCelebration] = useState(null);
-  const pomo = usePomodoro(pomoSettings);
+
+  // Gamificação: o estado mais recente fica numa ref para que ações seguidas somem XP corretamente
+  const [gam, setGam] = useState(makeGamState);
+  const gamRef = useRef(gam);
+  const [reward, setReward] = useState(null);
+  const rewardTimeoutRef = useRef(null);
+
+  const giveXP = useCallback((action, ctx = {}) => {
+    const r = award(gamRef.current, action, ctx);
+    gamRef.current = r.gam;
+    setGam(r.gam);
+    if (r.skipped) return r;
+    if (r.gainedXP > 0 || r.levelUp || r.newBadges.length || r.missionsDone.length) {
+      const actionMsg = r.goalHit ? goalHitMessage() : narrativeForAction(action);
+      setReward((prev) => (prev && Date.now() - prev.ts < 1500 ? mergeReward(prev, r, actionMsg) : { ...r, actionMsg, ts: Date.now() }));
+      if (rewardTimeoutRef.current) clearTimeout(rewardTimeoutRef.current);
+      rewardTimeoutRef.current = setTimeout(() => setReward(null), 5000);
+    }
+    return r;
+  }, []);
+
+  const pomo = usePomodoro(pomoSettings, giveXP);
+
+  // Vira o dia com o app aberto: zera a meta diária
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (gamRef.current.today?.date && gamRef.current.today.date !== todayISO()) {
+        const g = normalizeGam(gamRef.current);
+        gamRef.current = g;
+        setGam(g);
+      }
+    }, 60000);
+    return () => clearInterval(iv);
+  }, []);
 
   useEffect(() => {
     (async () => {
-      const [s, sc, ag, dk, ps, pl] = await Promise.all([
+      const [s, sc, ag, dk, ps, pl, gm] = await Promise.all([
         loadKey("subjects", null),
         loadKey("schedule", null),
         loadKey("agenda", []),
         loadKey("decks", []),
         loadKey("pomo-settings", null),
         loadKey("plan-settings", null),
+        loadKey(GAM_STORAGE_KEY, null),
       ]);
       setSubjects(s || seedSubjects());
       setSchedule(sc || (() => { const o = {}; DAYS.forEach((d) => (o[d.key] = [])); return o; })());
@@ -478,6 +540,9 @@ export default function StudyPlanner() {
       setDecks(dk || []);
       setPomoSettings(ps || { work: 25, short: 5, long: 15, cyclesUntilLong: 4 });
       setPlanSettings(pl || { defaultHours: 2 });
+      const g = normalizeGam(gm);
+      gamRef.current = g;
+      setGam(g);
       setLoaded(true);
     })();
   }, []);
@@ -488,6 +553,16 @@ export default function StudyPlanner() {
   useEffect(() => { if (loaded) saveKey("decks", decks); }, [decks, loaded]);
   useEffect(() => { if (loaded) saveKey("pomo-settings", pomoSettings); }, [pomoSettings, loaded]);
   useEffect(() => { if (loaded) saveKey("plan-settings", planSettings); }, [planSettings, loaded]);
+  useEffect(() => { if (loaded) saveKey(GAM_STORAGE_KEY, gam); }, [gam, loaded]);
+
+  // Mensagem do "treinador" no topo do Cronograma
+  const coach = useMemo(() => {
+    const w = streakWarning(gam);
+    if (w) return { text: w, tone: "risk" };
+    const c = comebackMessage(gam);
+    if (c) return { text: c, tone: "back" };
+    return { text: greeting(), tone: "normal" };
+  }, [gam.streak.last, gam.streak.current]); // eslint-disable-line
 
   // Estimativa de dias para concluir (geral e por matéria) + comparação com a prova
   const estimate = useMemo(
@@ -506,6 +581,7 @@ export default function StudyPlanner() {
     { key: "flashcards", label: "Flashcards", icon: Layers },
     { key: "questoes", label: "Questões", icon: Brain },
     { key: "desempenho", label: "Desempenho", icon: BarChart3 },
+    { key: "conquistas", label: "Conquistas", icon: Award },
     { key: "dicas", label: "Dicas", icon: Lightbulb },
     { key: "concursos", label: "Concursos", icon: Newspaper },
   ];
@@ -522,7 +598,7 @@ export default function StudyPlanner() {
   return (
     <div style={{ background: COLORS.bg, color: COLORS.text }} className="font-body min-h-screen w-full">
       <style>{FONT_STYLE}</style>
-      <Header />
+      <Header gam={gam} />
       <nav className="sticky top-0 z-20 border-b overflow-x-auto" style={{ background: "rgba(15,24,38,0.92)", backdropFilter: "blur(8px)", borderColor: COLORS.cardBorder }}>
         <div className="flex gap-1 px-3 py-2 min-w-max">
           {tabs.map((t) => {
@@ -549,25 +625,30 @@ export default function StudyPlanner() {
       <main className="px-3 sm:px-6 py-5 max-w-5xl mx-auto">
         {tab === "cronograma" && (
           <Cronograma subjects={subjects} setSubjects={setSubjects} schedule={schedule} setSchedule={setSchedule} onCelebrate={setCelebration}
-            estimate={estimate} planSettings={planSettings} setPlanSettings={setPlanSettings} />
+            estimate={estimate} planSettings={planSettings} setPlanSettings={setPlanSettings}
+            giveXP={giveXP} gam={gam} coach={coach} />
         )}
         {tab === "agenda" && <Agenda agenda={agenda} setAgenda={setAgenda} />}
         {tab === "pomodoro" && <Pomodoro pomo={pomo} settings={pomoSettings} setSettings={setPomoSettings} />}
-        {tab === "flashcards" && <Flashcards decks={decks} setDecks={setDecks} />}
-        {tab === "questoes" && <Questoes />}
+        {tab === "flashcards" && <Flashcards decks={decks} setDecks={setDecks} giveXP={giveXP} />}
+        {tab === "questoes" && <Questoes giveXP={giveXP} />}
         {tab === "desempenho" && <Desempenho subjects={subjects} estimate={estimate} exam={exam} planSettings={planSettings} />}
+        {tab === "conquistas" && (
+          <AchievementsScreen gam={gam} onSetGoal={(v) => setGam((g) => { const n = { ...g, dailyGoal: v }; gamRef.current = n; return n; })} />
+        )}
         {tab === "dicas" && <Dicas />}
-        {tab === "concursos" && <Concursos />}
+        {tab === "concursos" && <Concursos giveXP={giveXP} />}
       </main>
 
       <PomodoroChip pomo={pomo} tab={tab} setTab={setTab} />
       <CelebrationToast celebration={celebration} onClose={() => setCelebration(null)} />
+      <RewardToast reward={reward} onClose={() => setReward(null)} />
       <PomodoroAlert pomo={pomo} />
     </div>
   );
 }
 
-function Header() {
+function Header({ gam }) {
   const fileInputRef = useRef(null);
   const [msg, setMsg] = useState(null);
 
@@ -601,7 +682,8 @@ function Header() {
             Diário Oficial da Aprovação
           </h1>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          {gam && <GamHeaderStrip gam={gam} />}
           <Btn onClick={exportAllData} variant="ghost" small><Download size={13} /> Salvar registro</Btn>
           <Btn onClick={handleImportClick} variant="ghost" small><Upload size={13} /> Abrir registro</Btn>
           <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={handleFileChange} />
@@ -674,7 +756,7 @@ function Select(props) {
 }
 
 /* ================= CRONOGRAMA ================= */
-function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate, estimate, planSettings, setPlanSettings }) {
+function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate, estimate, planSettings, setPlanSettings, giveXP, gam, coach }) {
   const [activeDay, setActiveDay] = useState("seg");
   const [editingId, setEditingId] = useState(null);
   const [newSubtopic, setNewSubtopic] = useState("");
@@ -724,19 +806,29 @@ function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate,
       return next;
     });
   };
+  // Mensagem de incentivo + XP quando uma submatéria passa de pendente para concluída
+  const rewardSubtopic = (subj, sub) => {
+    const total = subj.subtopics.length;
+    const doneCount = subj.subtopics.filter((t) => t.done).length + 1;
+    const wholeSubject = doneCount >= total;
+    if (onCelebrate) {
+      onCelebrate(buildCelebration({
+        kind: wholeSubject ? "subject" : "sub",
+        subjectName: subj.name, subtopicName: sub.name, done: doneCount, total,
+      }));
+    }
+    if (giveXP) {
+      // onceKey: marcar e desmarcar a mesma submatéria não rende XP de novo
+      giveXP("subtopicDone", { onceKey: `sub:${sub.id}` });
+      if (wholeSubject) giveXP("subjectDone", { onceKey: `subj:${subj.id}` });
+    }
+  };
   const setSubtopicDone = (subjectId, subtopicId, done) => {
     const subj = subjects.find((s) => s.id === subjectId);
     const sub = subj?.subtopics.find((t) => t.id === subtopicId);
     if (!subj || !sub) return;
     updateSubtopic(subjectId, subtopicId, { done });
-    if (done && !sub.done && onCelebrate) {
-      const total = subj.subtopics.length;
-      const doneCount = subj.subtopics.filter((t) => t.done).length + 1;
-      onCelebrate(buildCelebration({
-        kind: doneCount >= total ? "subject" : "sub",
-        subjectName: subj.name, subtopicName: sub.name, done: doneCount, total,
-      }));
-    }
+    if (done && !sub.done) rewardSubtopic(subj, sub);
   };
 
   const addSlot = () => {
@@ -761,17 +853,10 @@ function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate,
     if (slot?.subjectId && slot?.subtopicId) {
       setSubjects((prev) => prev.map((s) => s.id === slot.subjectId ? { ...s, subtopics: s.subtopics.map((t) => t.id === slot.subtopicId ? { ...t, done: !slot.done } : t) } : s));
       // Mensagem de incentivo: só quando a submatéria passa de pendente para concluída
-      if (!slot.done && onCelebrate) {
+      if (!slot.done) {
         const subj = subjects.find((s) => s.id === slot.subjectId);
         const sub = subj?.subtopics.find((t) => t.id === slot.subtopicId);
-        if (subj && sub && !sub.done) {
-          const total = subj.subtopics.length;
-          const done = subj.subtopics.filter((t) => t.done).length + 1;
-          onCelebrate(buildCelebration({
-            kind: done >= total ? "subject" : "sub",
-            subjectName: subj.name, subtopicName: sub.name, done, total,
-          }));
-        }
+        if (subj && sub && !sub.done) rewardSubtopic(subj, sub);
       }
     }
   };
@@ -825,6 +910,13 @@ function Cronograma({ subjects, setSubjects, schedule, setSchedule, onCelebrate,
 
   return (
     <div className="space-y-5">
+      {gam && <DailyGoalBar gam={gam} />}
+      {coach && (
+        <div className="rounded-lg p-3 border-l-4" data-testid="coach"
+          style={{ borderColor: coach.tone === "risk" ? COLORS.rose : COLORS.gold, background: COLORS.card }}>
+          <p className="text-xs" style={{ color: COLORS.text }}>{coach.text}</p>
+        </div>
+      )}
       {/* Legend */}
       <Card>
         <div className="flex flex-wrap items-center gap-4">
@@ -1182,14 +1274,30 @@ function Pomodoro({ pomo, settings, setSettings }) {
 }
 
 /* ================= FLASHCARDS ================= */
-function Flashcards({ decks, setDecks }) {
+function Flashcards({ decks, setDecks, giveXP }) {
   const [deckName, setDeckName] = useState("");
   const [activeDeckId, setActiveDeckId] = useState(null);
   const [form, setForm] = useState({ front: "", back: "" });
-  const [studyIndex, setStudyIndex] = useState(0);
+  const [queue, setQueue] = useState([]);        // ids dos cartões da sessão de estudo
+  const [studyAll, setStudyAll] = useState(false); // false = só os que vencem hoje
+  const [reviewed, setReviewed] = useState(0);
   const [flipped, setFlipped] = useState(false);
 
   const activeDeck = decks.find((d) => d.id === activeDeckId);
+
+  const buildQueue = (deck, all) => (deck ? deck.cards.filter((c) => all || isCardDue(c)).map((c) => c.id) : []);
+  const startSession = (deck, all = false) => {
+    setStudyAll(all);
+    setQueue(buildQueue(deck, all));
+    setReviewed(0);
+    setFlipped(false);
+  };
+  // Refaz a fila quando troca de baralho ou quando cartões são adicionados/removidos/importados
+  useEffect(() => {
+    startSession(activeDeck, studyAll);
+  }, [activeDeckId, activeDeck ? activeDeck.cards.length : 0]); // eslint-disable-line
+
+  const current = activeDeck && queue.length ? activeDeck.cards.find((c) => c.id === queue[0]) : null;
 
   const addDeck = () => {
     if (!deckName.trim()) return;
@@ -1206,9 +1314,14 @@ function Flashcards({ decks, setDecks }) {
   };
   const removeCard = (cardId) => setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: d.cards.filter((c) => c.id !== cardId) } : d));
   const markCard = (know) => {
-    setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: d.cards.map((c, i) => i === studyIndex ? { ...c, box: know ? Math.min(3, c.box + 1) : 1 } : c) } : d));
+    if (!current) return;
+    // Revisão espaçada: acertou sobe de caixa (intervalo maior); errou volta para a caixa 1
+    setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: d.cards.map((c) => (c.id === current.id ? reviewCard(c, know) : c)) } : d));
+    if (know && giveXP) giveXP("flashcardKnow");
+    // Acertou: sai da fila. Errou: volta para o fim da fila desta sessão
+    setQueue((q) => (know ? q.slice(1) : [...q.slice(1), q[0]]));
+    setReviewed((n) => n + 1);
     setFlipped(false);
-    setStudyIndex((i) => (i + 1) % Math.max(1, activeDeck.cards.length));
   };
 
   return (
@@ -1222,9 +1335,9 @@ function Flashcards({ decks, setDecks }) {
         <div className="flex flex-wrap gap-2">
           {decks.map((d) => (
             <div key={d.id} className="flex items-center gap-1.5">
-              <button onClick={() => { setActiveDeckId(d.id); setStudyIndex(0); setFlipped(false); }}
+              <button onClick={() => { setActiveDeckId(d.id); setFlipped(false); }}
                 className="px-3 py-1.5 rounded-lg text-xs font-medium" style={{ background: activeDeckId === d.id ? COLORS.teal : COLORS.bg2, color: activeDeckId === d.id ? "#0B121D" : COLORS.sub }}>
-                {d.name} ({d.cards.length})
+                {d.name} ({d.cards.length}{d.cards.filter((c) => isCardDue(c)).length ? ` · ${d.cards.filter((c) => isCardDue(c)).length} p/ revisar` : ""})
               </button>
               <button onClick={() => removeDeck(d.id)}><Trash2 size={12} style={{ color: COLORS.rose }} /></button>
             </div>
@@ -1253,17 +1366,38 @@ function Flashcards({ decks, setDecks }) {
           </Card>
 
           {activeDeck.cards.length > 0 && (
-            <Card className="flex flex-col items-center py-8">
+            <Card className="flex flex-col items-center py-8" data-testid="study">
               <SectionTitle icon={Sparkles}>Modo estudo</SectionTitle>
-              <div onClick={() => setFlipped((f) => !f)} className="w-full max-w-md h-52 rounded-xl border-2 flex items-center justify-center text-center px-6 cursor-pointer select-none"
-                style={{ borderColor: COLORS.gold, background: COLORS.bg2 }}>
-                <p className="font-display text-lg">{flipped ? activeDeck.cards[studyIndex % activeDeck.cards.length].back : activeDeck.cards[studyIndex % activeDeck.cards.length].front}</p>
-              </div>
-              <p className="text-[11px] mt-2" style={{ color: COLORS.sub }}>Toque no cartão para virar</p>
-              <div className="flex items-center gap-3 mt-4">
-                <Btn onClick={() => markCard(false)} variant="danger"><X size={14} /> Não sabia</Btn>
-                <Btn onClick={() => markCard(true)}><Check size={14} /> Sabia</Btn>
-              </div>
+              {current ? (
+                <>
+                  <p className="text-[11px] mb-2 font-mono" style={{ color: COLORS.sub }}>
+                    {studyAll ? "Todos os cartões" : "Revisão de hoje"} · na fila: {queue.length} · revisados: {reviewed}
+                  </p>
+                  <div onClick={() => setFlipped((f) => !f)} className="w-full max-w-md h-52 rounded-xl border-2 flex items-center justify-center text-center px-6 cursor-pointer select-none"
+                    style={{ borderColor: COLORS.gold, background: COLORS.bg2 }}>
+                    <p className="font-display text-lg whitespace-pre-wrap">{flipped ? current.back : current.front}</p>
+                  </div>
+                  <p className="text-[11px] mt-2" style={{ color: COLORS.sub }}>Toque no cartão para virar · caixa {current.box || 1} de 5</p>
+                  <div className="flex items-center gap-3 mt-4">
+                    <Btn onClick={() => markCard(false)} variant="danger"><X size={14} /> Não sabia</Btn>
+                    <Btn onClick={() => markCard(true)}><Check size={14} /> Sabia</Btn>
+                  </div>
+                </>
+              ) : (
+                <div className="text-center">
+                  <p className="text-sm mb-1" style={{ color: COLORS.teal }}>
+                    {reviewed > 0 ? "Sessão concluída!" : "Nenhum cartão para revisar hoje."}
+                  </p>
+                  <p className="text-[11px] mb-3" style={{ color: COLORS.sub }}>
+                    {reviewed > 0
+                      ? "Os cartões voltam na data certa, conforme a caixa de cada um."
+                      : "Os cartões voltam na data da próxima revisão. Você também pode estudar tudo agora."}
+                  </p>
+                  <div className="flex items-center justify-center gap-2">
+                    <Btn onClick={() => startSession(activeDeck, true)} variant="ghost" small><RotateCcw size={13} /> Estudar todos os cartões</Btn>
+                  </div>
+                </div>
+              )}
             </Card>
           )}
         </>
@@ -1399,13 +1533,19 @@ function AnkiPanel({ decks, setDecks, activeDeck }) {
 }
 
 /* ================= QUESTÕES (geração automática via API) ================= */
-function Questoes() {
+function Questoes({ giveXP }) {
   const [topic, setTopic] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [quiz, setQuiz] = useState(null);
   const [answers, setAnswers] = useState({});
   const [submitted, setSubmitted] = useState(false);
+
+  const checkAnswers = () => {
+    setSubmitted(true);
+    const correct = quiz.reduce((n, q, i) => n + (answers[i] === q.correctIndex ? 1 : 0), 0);
+    if (giveXP) for (let i = 0; i < correct; i++) giveXP("questionRight");
+  };
 
   const generate = async () => {
     if (!topic.trim()) return;
@@ -1468,7 +1608,7 @@ function Questoes() {
               </div>
             ))}
             {!submitted ? (
-              <Btn onClick={() => setSubmitted(true)}><Check size={14} /> Corrigir</Btn>
+              <Btn onClick={checkAnswers}><Check size={14} /> Corrigir</Btn>
             ) : (
               <p className="text-sm font-medium" style={{ color: COLORS.gold }}>Resultado: {score}/{quiz.length} acertos</p>
             )}
@@ -1610,7 +1750,7 @@ function Dicas() {
 }
 
 /* ================= CONCURSOS (acompanhamento manual) ================= */
-function Concursos() {
+function Concursos({ giveXP }) {
   const [items, setItems] = useState([]);
   const [form, setForm] = useState({ orgao: "", abrangencia: "federal", estado: "", municipio: "", status: "aguardando edital", link: "", provaEm: "" });
   const [loadedFlag, setLoadedFlag] = useState(false);
@@ -1622,6 +1762,7 @@ function Concursos() {
   const add = () => {
     if (!form.orgao.trim()) return;
     setItems((prev) => [...prev, { id: uid(), ...form }]);
+    if (giveXP) giveXP("misc", { concursosCount: items.length + 1 });
     setForm({ orgao: "", abrangencia: "federal", estado: "", municipio: "", status: "aguardando edital", link: "", provaEm: "" });
   };
   const remove = (id) => setItems((prev) => prev.filter((i) => i.id !== id));

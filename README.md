@@ -68,6 +68,20 @@ npm run dev
 
 Abre em `http://localhost:5173`.
 
+## Gamificação
+
+- Cada ação dá XP: submatéria concluída (50), matéria inteira (200), bloco de
+  foco do Pomodoro (10), cartão "Sabia" (2) e questão certa (3). Marcar e
+  desmarcar a mesma submatéria não rende XP de novo.
+- A aba **Conquistas** mostra nível e cargo, meta diária (ajustável), missões
+  da semana e os carimbos desbloqueados. O cabeçalho mostra a ofensiva de dias
+  e o nível, e o Cronograma mostra a meta do dia.
+- Os flashcards agora usam revisão espaçada: o modo estudo mostra os cartões
+  que vencem hoje (caixas de 1 a 5, com intervalos de 1, 3, 7, 15 e 30 dias).
+  Quem erra volta para a caixa 1, e o cartão reaparece no fim da sessão.
+- O progresso entra no backup (Salvar/Abrir registro).
+- Testes da lógica: `npm install` e depois `npm test`.
+
 ## Matérias e estimativa de término
 
 - No Cronograma, o lápis ao lado de cada matéria abre a edição: nome,
