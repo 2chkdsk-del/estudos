@@ -12,6 +12,10 @@ import {
 import {
   narrativeForAchievement, narrativeForReward, streakWarning, comebackMessage,
 } from "./gamificationNarrative.js";
+import {
+  ankiCardToBox, boxToAnkiCardState, makeCrt, isoToAnkiDay, ankiDayToISO,
+  applyProgressToCards, buildProgressForExport,
+} from "./ankiHistory.js";
 
 /* Estado de teste com missões fixas, para o resultado não depender do sorteio */
 function freshGam(overrides = {}) {
@@ -124,6 +128,16 @@ describe("streak", () => {
     g = updateStreak(g, "2026-01-02");
     g = updateStreak(g, "2026-01-05");
     expect(g.streak.current).toBe(1);
+  });
+
+  it("relógio que volta no tempo não zera a ofensiva nem gasta freeze", () => {
+    let g = makeGamState();
+    g = updateStreak(g, "2026-01-05");
+    g = updateStreak(g, "2026-01-06");
+    const back = updateStreak(g, "2026-01-04");
+    expect(back.streak.current).toBe(2);
+    expect(back.streak.last).toBe("2026-01-06");
+    expect(back.streak.freezes).toBe(1);
   });
 
   it("mesmo dia não incrementa", () => {
@@ -492,5 +506,140 @@ describe("integração: fluxo de estudo de um dia", () => {
     expect(g.today.xp).toBeGreaterThanOrEqual(100);
     expect(g.unlocked.first_sub).toBeDefined();
     expect(g.unlocked.perfect_day).toBeDefined();
+  });
+});
+
+/* =========================================================
+   ANKI: conversão de progresso (caixas <-> estado do Anki)
+   ========================================================= */
+describe("ankiHistory: conversão box <-> Anki", () => {
+  it("cartão novo (type 0, reps 0) vira box 1", () => {
+    expect(ankiCardToBox({ type: 0, reps: 0 })).toBe(1);
+  });
+
+  it("cartão em aprendizado (queue 1) vira box 1", () => {
+    expect(ankiCardToBox({ type: 1, queue: 1, reps: 1, ivl: 1 })).toBe(1);
+  });
+
+  it("cartão em revisão: intervalo define a caixa", () => {
+    expect(ankiCardToBox({ type: 2, queue: 2, reps: 10, ivl: 60, factor: 2500 })).toBe(5);
+    expect(ankiCardToBox({ type: 2, queue: 2, reps: 3, ivl: 8, factor: 2500 })).toBe(3);
+    expect(ankiCardToBox({ type: 2, queue: 2, reps: 5, ivl: 20, factor: 2500 })).toBe(4);
+  });
+
+  it("factor baixo rebaixa 1 caixa e factor alto sobe 1 (até 5)", () => {
+    expect(ankiCardToBox({ type: 2, queue: 2, reps: 3, ivl: 8, factor: 1900 })).toBe(2);
+    expect(ankiCardToBox({ type: 2, queue: 2, reps: 5, ivl: 20, factor: 3000 })).toBe(5);
+  });
+
+  it("ida e volta caixa -> estado -> caixa preserva 1 a 5", () => {
+    for (let b = 1; b <= 5; b++) {
+      expect(ankiCardToBox(boxToAnkiCardState(b))).toBe(b);
+    }
+  });
+
+  it("caixa 1 exporta como novo; caixas 2 a 5 como revisão", () => {
+    expect(boxToAnkiCardState(1).type).toBe(0);
+    for (let b = 2; b <= 5; b++) {
+      const st = boxToAnkiCardState(b);
+      expect(st.type).toBe(2);
+      expect(st.queue).toBe(2);
+      expect(st.ivl).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("ankiHistory: dias do Anki (relativos à criação da coleção)", () => {
+  const crt = Math.floor(new Date(2025, 5, 1, 4, 0, 0).getTime() / 1000); // 01/06/2025 04:00 local
+
+  it("dia 0 é o dia da criação e o dia 100 é 100 dias depois", () => {
+    expect(ankiDayToISO(0, crt)).toBe("2025-06-01");
+    expect(ankiDayToISO(100, crt)).toBe("2025-09-09");
+  });
+
+  it("isoToAnkiDay e ankiDayToISO são inversos", () => {
+    expect(isoToAnkiDay("2025-09-09", crt)).toBe(100);
+    expect(ankiDayToISO(isoToAnkiDay("2026-02-01", crt), crt)).toBe("2026-02-01");
+  });
+
+  it("data vencida ou vazia vira dia 0 (revisar hoje)", () => {
+    expect(isoToAnkiDay("2020-01-01", crt)).toBe(0);
+    expect(isoToAnkiDay(null, crt)).toBe(0);
+  });
+
+  it("makeCrt: antes das 4h usa o dia anterior", () => {
+    const early = makeCrt(new Date(2026, 0, 10, 2, 0, 0));
+    expect(ankiDayToISO(0, early)).toBe("2026-01-09");
+    const day = makeCrt(new Date(2026, 0, 10, 10, 0, 0));
+    expect(ankiDayToISO(0, day)).toBe("2026-01-10");
+  });
+});
+
+describe("ankiHistory: importar progresso", () => {
+  const crt = Math.floor(new Date(2025, 5, 1, 4, 0, 0).getTime() / 1000);
+
+  it("mapeia ivl para a caixa e due para dueAt", () => {
+    const cards = [{ nid: 1, front: "a", back: "b" }];
+    const prog = new Map([[1, { ivl: 8, factor: 2500, type: 2, queue: 2, reps: 3, due: 100 }]]);
+    const out = applyProgressToCards(cards, prog, new Map(), crt);
+    expect(out[0].box).toBe(3);
+    expect(out[0].dueAt).toBe("2025-09-09");
+    expect(out[0].lastReview).toBe("2025-09-01"); // due - ivl
+  });
+
+  it("a última revisão vem do id do revlog (horário), não da duração", () => {
+    const cards = [{ nid: 1, front: "a", back: "b" }];
+    const prog = new Map([[1, { ivl: 8, factor: 2500, type: 2, queue: 2, reps: 3, due: 100 }]]);
+    const revlog = new Map([[1, [{ id: new Date(2025, 7, 30, 12).getTime(), time: 15000 }]]]);
+    const out = applyProgressToCards(cards, prog, revlog, crt);
+    expect(out[0].lastReview).toBe("2025-08-30");
+  });
+
+  it("cartão novo ou em aprendizado não ganha data de vencimento", () => {
+    const cards = [{ nid: 1, front: "a", back: "b" }, { nid: 2, front: "c", back: "d" }];
+    const prog = new Map([
+      [1, { ivl: 0, factor: 0, type: 0, queue: 0, reps: 0, due: 5 }],          // posição na fila
+      [2, { ivl: 0, factor: 2500, type: 1, queue: 1, reps: 1, due: 1790000000 }], // horário em segundos
+    ]);
+    const out = applyProgressToCards(cards, prog, new Map(), crt);
+    expect(out[0].box).toBe(1);
+    expect(out[0].dueAt).toBeNull();
+    expect(out[1].box).toBe(1);
+    expect(out[1].dueAt).toBeNull();
+  });
+
+  it("sem progresso no Anki entra como novo", () => {
+    const out = applyProgressToCards([{ nid: 99, front: "a", back: "b" }], new Map(), new Map(), crt);
+    expect(out[0].box).toBe(1);
+    expect(out[0].dueAt).toBeNull();
+  });
+});
+
+describe("ankiHistory: exportar progresso", () => {
+  const crt = makeCrt();
+
+  it("caixa 3 vira cartão em revisão com data, intervalo e revlog", () => {
+    const decks = [{ id: "d1", name: "Teste", cards: [{ id: "c1", front: "a", back: "b", box: 3, dueAt: "2999-01-01", lastReview: "2026-01-25" }] }];
+    const p = buildProgressForExport(decks, crt).byCardId.get("c1");
+    expect(p.type).toBe(2);
+    expect(p.ivl).toBeGreaterThan(0);
+    expect(p.due).toBeGreaterThan(0);
+    expect(p.revlog).toHaveLength(2); // saltos 1->2 e 2->3
+    expect(p.revlog[0].id).toBeLessThanOrEqual(p.revlog[1].id);
+    expect(p.revlog[1].id).toBe(new Date(2026, 0, 25, 12).getTime());
+  });
+
+  it("caixa 1 é cartão novo, sem revlog e sem data", () => {
+    const decks = [{ id: "d", name: "x", cards: [{ id: "c", front: "a", back: "b", box: 1 }] }];
+    const p = buildProgressForExport(decks, crt).byCardId.get("c");
+    expect(p.revlog).toHaveLength(0);
+    expect(p.type).toBe(0);
+    expect(p.due).toBeNull();
+  });
+
+  it("o horário de cada revisão do revlog nunca é futuro", () => {
+    const decks = [{ id: "d", name: "x", cards: [{ id: "c", front: "a", back: "b", box: 5, lastReview: "2999-01-01" }] }];
+    const p = buildProgressForExport(decks, crt).byCardId.get("c");
+    for (const r of p.revlog) expect(r.id).toBeLessThanOrEqual(Date.now());
   });
 });

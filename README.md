@@ -68,6 +68,66 @@ npm run dev
 
 Abre em `http://localhost:5173`.
 
+## Progresso do Anki (importar e exportar)
+
+Os pacotes .apkg/.colpkg também levam o estado de revisão dos cartões.
+
+**Importar:** cada cartão é lido com o estado que tinha no Anki e convertido para
+as caixas do app:
+
+- novo ou em aprendizado: caixa 1
+- intervalo de até 4 dias: caixa 2; até 10 dias: caixa 3; até 25 dias: caixa 4;
+  acima disso: caixa 5
+- fator de facilidade abaixo de 2,0 rebaixa 1 caixa; acima de 2,8 sobe 1
+- a próxima revisão vem do campo `due`, que no Anki conta dias desde a criação
+  da coleção (e só vale como data para cartões em revisão)
+- a última revisão vem do `revlog` (horário da revisão) ou, se faltar, de
+  próxima revisão menos o intervalo
+
+**Exportar:** com a opção "Incluir progresso de revisão" marcada, cada cartão
+vai com tipo, fila, intervalo, fator e data de revisão coerentes com a caixa,
+e o revlog recebe uma revisão por salto de caixa. Desmarcada, os cartões entram
+como novos no Anki. O arquivo .txt leva só o texto.
+
+**Limitações**
+
+- O Anki usa SM-2/FSRS com intervalos variáveis; o app usa caixas fixas (1, 3,
+  7, 15 e 30 dias). A conversão guarda a "sensação" do cartão (novo, difícil,
+  maduro), não os intervalos exatos.
+- O revlog exportado é sintético: as estatísticas do Anki mostrarão uma curva
+  plausível, não a real.
+- Imagens e áudios não são importados nem exportados.
+- O GUID dos cartões vem do próprio cartão do app, então exportar o mesmo
+  baralho de novo não duplica no Anki, e corrigir o texto de um cartão atualiza
+  a nota em vez de criar outra.
+- A exportação usa o formato antigo (collection.anki2). O Anki atual importa;
+  se der problema, use o .txt.
+
+## Offline (vite-plugin-pwa)
+
+Depois de instalado, o app abre sem internet, inclusive na primeira abertura offline.
+
+- O Tailwind agora é compilado no build (antes vinha de um CDN em tempo de
+  execução). Sem isso a tela abriria sem estilo offline.
+- O service worker (`src/sw.js`) pré-cacheia todos os arquivos do build (JS,
+  CSS, HTML, ícones). O plugin injeta a lista de arquivos a cada build.
+- As bibliotecas do Anki (JSZip, sql.js, fzstd) e as fontes do Google ficam em
+  cache depois do primeiro uso com internet. Sem as fontes, o app usa as fontes
+  do sistema.
+- Gerar questões (Gemini) continua precisando de internet.
+- A versão nova de um deploy é baixada em segundo plano e vale no próximo
+  carregamento do app.
+
+Como conferir depois do deploy:
+
+1. Abra o site com internet e espere carregar por completo.
+2. No Chrome: DevTools > Application > Service Workers (deve estar "activated")
+   e Cache Storage (deve ter um `workbox-precache-...`).
+3. Marque Network > Offline e recarregue: o app deve abrir com o visual normal.
+
+Localmente: `npm run build && npm run preview`. O service worker só existe no
+build, não no `npm run dev`.
+
 ## Gamificação
 
 - Cada ação dá XP: submatéria concluída (50), matéria inteira (200), bloco de

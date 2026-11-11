@@ -83,6 +83,8 @@ function daysBetween(isoA, isoB) {
 export function updateStreak(gam, dateISO = todayISO()) {
   const s = gam.streak || { current: 0, best: 0, last: null, freezes: 1 };
   if (s.last === dateISO) return { ...gam, streak: s };
+  // Relógio voltou (mudança de fuso/horário do aparelho): não mexe na ofensiva nem gasta freeze
+  if (s.last && daysBetween(s.last, dateISO) <= 0) return { ...gam, streak: s };
   let { current, freezes } = s;
   if (!s.last) {
     current = 1;

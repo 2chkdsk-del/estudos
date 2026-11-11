@@ -1,8 +1,14 @@
 // Importação e exportação de flashcards no formato do Anki.
 //  - Texto/CSV/TSV (File > Import do Anki, com cabeçalhos #separator, #html, #deck column...)
-//  - Pacotes .apkg / .colpkg (baralhos completos). Exporta no formato "legado" (collection.anki2),
-//    que todas as versões atuais do Anki importam. Importa o legado e o novo (anki21b, zstd).
+//  - Pacotes .apkg / .colpkg (baralhos completos, com ou sem progresso de revisão).
+//    Exporta no formato "legado" (collection.anki2) com cartões + revlog, que todas as versões
+//    atuais do Anki importam. Importa o legado e o novo (anki21b, zstd).
 // As bibliotecas pesadas (JSZip, sql.js, fzstd) só são carregadas quando necessário.
+
+import {
+  readCrt, readCardProgress, readRevlog, applyProgressToCards, buildProgressForExport, makeCrt,
+} from "./ankiHistory.js";
+import { getImage } from "./imageStore.js";
 
 export const SEP = "\x1f";
 const CLOZE_TEST = /\{\{c\d+::/;
@@ -35,6 +41,29 @@ export function htmlToText(html) {
 
 export function textToHtml(text) {
   return String(text ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r?\n/g, "<br>");
+}
+
+
+/* ---------------- cartões com formatação (editor rico) ---------------- */
+// Cartões criados no editor rico têm html:true e guardam HTML (imagens como app://<id>).
+// Cartões antigos/importados continuam texto puro.
+function sideHtmlNoImages(text, isHtml) {
+  return isHtml ? String(text ?? "").replace(/<img[^>]*>/gi, "") : textToHtml(text);
+}
+function sideToPlain(text, isHtml) {
+  return isHtml ? htmlToText(text) : String(text ?? "");
+}
+async function resolveImagesForExport(html) {
+  if (!html || !/app:\/\//.test(html)) return html;
+  const ids = Array.from(new Set(Array.from(html.matchAll(/app:\/\/([^"]+)/g)).map((m) => m[1])));
+  const map = {};
+  for (const id of ids) {
+    try { const rec = await getImage(id); if (rec) map[id] = rec.dataUrl; } catch { /* sem imagem: mantém o src */ }
+  }
+  return html.replace(/app:\/\/([^"]+)/g, (m, id) => map[id] || m);
+}
+async function sideHtmlForApkg(text, isHtml) {
+  return isHtml ? resolveImagesForExport(String(text ?? "")) : textToHtml(text);
 }
 
 export function clozeToQA(field, extra = "") {
@@ -150,8 +179,8 @@ export function buildAnkiText(decks, { includeDeckColumn = false } = {}) {
   if (includeDeckColumn) lines.push("#deck column:3");
   for (const d of decks) {
     for (const c of d.cards) {
-      const front = textToHtml(c.front);
-      const cols = [quoteField(front, front.startsWith("#")), quoteField(textToHtml(c.back))];
+      const front = sideHtmlNoImages(c.front, c.html);
+      const cols = [quoteField(front, front.startsWith("#")), quoteField(sideHtmlNoImages(c.back, c.html))];
       if (includeDeckColumn) cols.push(quoteField(d.name));
       lines.push(cols.join("\t"));
     }
@@ -179,7 +208,10 @@ export function mergeImportedCards(decks, cards, makeId) {
     const k = keyOf(c);
     if (set.has(k)) { dup++; continue; }
     set.add(k);
-    const card = { id: makeId(), front: c.front, back: c.back, box: 1 };
+    // Cartões vindos de .apkg trazem o progresso (caixa, próxima revisão, última revisão)
+    const card = { id: makeId(), front: c.front, back: c.back, box: c.box || 1 };
+    if (c.dueAt) card.dueAt = c.dueAt;
+    if (c.lastReview) card.lastReview = c.lastReview;
     if (c.guid) card.guid = c.guid;
     deck.cards.push(card);
     added++;
@@ -202,6 +234,7 @@ function loadScriptOnce(url) {
       const s = document.createElement("script");
       s.src = url;
       s.async = true;
+      s.crossOrigin = "anonymous"; // resposta com CORS: pode ser guardada no cache offline
       s.onload = resolve;
       s.onerror = () => {
         delete scriptLoads[url];
@@ -257,12 +290,14 @@ export function readCollection(db) {
     } catch { /* sem nomes */ }
   }
   const cardDeck = {};
-  rowsOf(db, "SELECT nid, did FROM cards ORDER BY nid, ord").forEach((r) => {
+  const cardIdToNid = new Map();
+  rowsOf(db, "SELECT id, nid, did FROM cards ORDER BY nid, ord").forEach((r) => {
+    cardIdToNid.set(r.id, r.nid);
     if (cardDeck[r.nid] === undefined) cardDeck[r.nid] = r.did;
   });
   const out = [];
   let skipped = 0;
-  rowsOf(db, "SELECT id, guid, flds FROM notes").forEach((n) => {
+  rowsOf(db, "SELECT id AS nid, guid, flds FROM notes").forEach((n) => {
     const parts = String(n.flds).split(SEP).map(htmlToText);
     const first = parts[0] || "";
     const rest = parts.slice(1).filter(Boolean);
@@ -271,11 +306,19 @@ export function readCollection(db) {
     if (CLOZE_TEST.test(first)) ({ front, back } = clozeToQA(first, rest.join("\n\n")));
     else { front = first; back = rest.join("\n\n"); }
     if (!front || !back) { skipped++; return; }
-    let deck = deckNames[cardDeck[n.id]] || "Importados";
+    let deck = deckNames[cardDeck[n.nid]] || "Importados";
     if (deck.toLowerCase() === "default" || deck.toLowerCase() === "padrão") deck = "Importados";
-    out.push({ deck, front, back, guid: n.guid ? String(n.guid) : undefined });
+    out.push({ deck, front, back, nid: n.nid, guid: n.guid ? String(n.guid) : undefined });
   });
-  return { cards: out, skipped };
+
+  // Progresso de revisão (caixa, próxima revisão, última revisão). Se falhar, importa como novo.
+  let cards = out;
+  let withProgress = 0;
+  try {
+    cards = applyProgressToCards(out, readCardProgress(db), readRevlog(db, cardIdToNid), readCrt(db));
+    withProgress = cards.filter((c) => c.box > 1 || c.dueAt).length;
+  } catch { /* sem progresso */ }
+  return { cards, skipped, withProgress };
 }
 
 export async function parseApkgFile(file, deps = {}) {
@@ -359,7 +402,14 @@ const DCONF = {
   },
 };
 
-export async function buildApkgBlob(decks, deps = {}) {
+/**
+ * Gera um .apkg.
+ * @param {Array} decks
+ * @param {{withHistory?: boolean}} opts  withHistory (padrão: true) inclui caixa/próxima revisão/revlog
+ * @param {{JSZip?, SQL?, outputType?}} deps
+ */
+export async function buildApkgBlob(decks, opts = {}, deps = {}) {
+  const withHistory = opts.withHistory !== false;
   const JSZip = deps.JSZip || (await getJSZip());
   const SQL = deps.SQL || (await getSqlJs());
   const db = new SQL.Database();
@@ -380,29 +430,45 @@ export async function buildApkgBlob(decks, deps = {}) {
     newBury: true, newSpread: 0, nextPos: 1, sortBackwards: false, sortType: "noteFld", timeLim: 0,
   };
   const models = { [MODEL_ID]: modelJson(firstDeck, nowSec) };
+  // `due` dos cartões em revisão conta dias desde a criação da coleção (crt)
+  const crt = makeCrt();
+  const { byCardId } = withHistory ? buildProgressForExport(decks, crt) : { byCardId: new Map() };
+  const usedRevIds = new Set();
 
   try {
     db.run(SCHEMA);
     db.run("INSERT INTO col VALUES (1,?,?,?,11,0,0,0,?,?,?,?,?)", [
-      Math.floor(nowSec / 86400) * 86400, nowMs, nowMs, JSON.stringify(conf), JSON.stringify(models),
+      crt, nowMs, nowMs, JSON.stringify(conf), JSON.stringify(models),
       JSON.stringify(deckMap), JSON.stringify(DCONF), "{}",
     ]);
     db.run("BEGIN");
     const insNote = db.prepare("INSERT INTO notes VALUES (?,?,?,?,?,?,?,?,?,?,?)");
     const insCard = db.prepare("INSERT INTO cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    const insRev = db.prepare("INSERT INTO revlog VALUES (?,?,?,?,?,?,?,?,?)");
     let pos = 1;
     for (let di = 0; di < decks.length; di++) {
       for (const c of decks[di].cards) {
         const noteId = nextId();
         const cardId = nextId();
-        const csum = parseInt((await sha1Hex(c.front)).slice(0, 8), 16);
-        const flds = textToHtml(c.front) + SEP + textToHtml(c.back);
-        insNote.run([noteId, await guidFor(c), MODEL_ID, nowSec, -1, "", flds, c.front, csum, 0, ""]);
-        insCard.run([cardId, noteId, deckIds[di], 0, nowSec, -1, 0, 0, pos++, 0, 0, 0, 0, 0, 0, 0, 0, ""]);
+        const frontPlain = sideToPlain(c.front, c.html);
+        const csum = parseInt((await sha1Hex(frontPlain)).slice(0, 8), 16);
+        const flds = (await sideHtmlForApkg(c.front, c.html)) + SEP + (await sideHtmlForApkg(c.back, c.html));
+        const prog = byCardId.get(c.id) || { ivl: 0, factor: 0, type: 0, queue: 0, reps: 0, due: null, revlog: [] };
+        insNote.run([noteId, await guidFor(c), MODEL_ID, nowSec, -1, "", flds, frontPlain, csum, 0, ""]);
+        // cartão novo: `due` é a posição na fila; em revisão: dia (desde crt) da próxima revisão
+        insCard.run([cardId, noteId, deckIds[di], 0, nowSec, -1, prog.type, prog.queue, prog.due ?? pos, prog.ivl, prog.factor, prog.reps, 0, 0, 0, 0, 0, ""]);
+        pos++;
+        for (const r of prog.revlog || []) {
+          let revId = r.id; // horário da revisão (ms), chave primária: precisa ser único
+          while (usedRevIds.has(revId)) revId += 1;
+          usedRevIds.add(revId);
+          insRev.run([revId, cardId, -1, r.ease, r.ivl, r.lastIvl, r.factor, r.time, r.type]);
+        }
       }
     }
     insNote.free();
     insCard.free();
+    insRev.free();
     db.run("COMMIT");
     const bytes = db.export();
     const zip = new JSZip();

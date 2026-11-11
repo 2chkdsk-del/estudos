@@ -3,7 +3,8 @@ import {
   Plus, Trash2, Check, X, Clock, Calendar as CalendarIcon, Play, Pause,
   RotateCcw, BookOpen, Brain, BarChart3, Lightbulb, Newspaper, Bell,
   ChevronLeft, ChevronRight, Shuffle, Flame, Star, CircleDot, Sparkles,
-  Volume2, Award, Layers, ClipboardList, Wand2, Download, Upload, BellRing, Coffee, Trophy, Pencil, Hourglass
+  Volume2, Award, Layers, ClipboardList, Wand2, Download, Upload, BellRing, Coffee, Trophy, Pencil, Hourglass,
+  FolderInput, Square, CheckSquare, ListChecks, Undo2
 } from "lucide-react";
 import {
   RadialBarChart, RadialBar, PolarAngleAxis, ResponsiveContainer, Legend
@@ -12,8 +13,11 @@ import {
   makePomoState, pomoRemainingMs, pomoStart, pomoPause, pomoSwitch, pomoReset, pomoAdvance, formatClock,
 } from "./pomodoroLogic.js";
 import { buildCelebration } from "./encouragement.js";
+import RichTextEditor from "./RichTextEditor.jsx";
+import RichFace from "./RichFace.jsx";
+import { isEmptyHtml, htmlToPlainText } from "./richText.js";
 import {
-  makeGamState, normalizeGam, award, GAM_STORAGE_KEY, reviewCard, isCardDue, todayISO,
+  makeGamState, normalizeGam, award, GAM_STORAGE_KEY, reviewCard, isCardDue, todayISO, weekKey,
 } from "./gamification.js";
 import { GamHeaderStrip, DailyGoalBar, RewardToast, AchievementsScreen } from "./GamificationUI.jsx";
 import { greeting, streakWarning, comebackMessage, narrativeForAction, goalHitMessage } from "./gamificationNarrative.js";
@@ -509,15 +513,40 @@ export default function StudyPlanner() {
     return r;
   }, []);
 
+  // Desfazer: devolve o estado de XP de antes da ação. Se algo mudou o XP nesse meio tempo
+  // (ex.: um Pomodoro terminou), só desconta o que a ação tinha dado.
+  const getGam = useCallback(() => gamRef.current, []);
+  const undoXP = useCallback((before, after) => {
+    if (!before || !after) return;
+    let next;
+    if (gamRef.current === after) next = before;
+    else {
+      const diff = Math.max(0, after.xp - before.xp);
+      const cur = gamRef.current;
+      next = {
+        ...cur,
+        xp: Math.max(0, cur.xp - diff),
+        today: { ...cur.today, xp: Math.max(0, cur.today.xp - diff), flashcards: Math.max(0, cur.today.flashcards - 1) },
+        counters: { ...cur.counters, flashcards: Math.max(0, cur.counters.flashcards - 1) },
+      };
+    }
+    gamRef.current = next;
+    setGam(next);
+    setReward(null);
+  }, []);
+
   const pomo = usePomodoro(pomoSettings, giveXP);
 
-  // Vira o dia com o app aberto: zera a meta diária
+  // Vira o dia (zera a meta diária) ou a semana (renova as missões) com o app aberto
   useEffect(() => {
     const iv = setInterval(() => {
-      if (gamRef.current.today?.date && gamRef.current.today.date !== todayISO()) {
-        const g = normalizeGam(gamRef.current);
-        gamRef.current = g;
-        setGam(g);
+      const g = gamRef.current;
+      const needsDayReset = g.today?.date && g.today.date !== todayISO();
+      const needsWeekReset = g.missions && g.missions.weekKey !== weekKey();
+      if (needsDayReset || needsWeekReset) {
+        const n = normalizeGam(g);
+        gamRef.current = n;
+        setGam(n);
       }
     }, 60000);
     return () => clearInterval(iv);
@@ -630,7 +659,7 @@ export default function StudyPlanner() {
         )}
         {tab === "agenda" && <Agenda agenda={agenda} setAgenda={setAgenda} />}
         {tab === "pomodoro" && <Pomodoro pomo={pomo} settings={pomoSettings} setSettings={setPomoSettings} />}
-        {tab === "flashcards" && <Flashcards decks={decks} setDecks={setDecks} giveXP={giveXP} />}
+        {tab === "flashcards" && <Flashcards decks={decks} setDecks={setDecks} giveXP={giveXP} undoXP={undoXP} getGam={getGam} />}
         {tab === "questoes" && <Questoes giveXP={giveXP} />}
         {tab === "desempenho" && <Desempenho subjects={subjects} estimate={estimate} exam={exam} planSettings={planSettings} />}
         {tab === "conquistas" && (
@@ -1274,7 +1303,39 @@ function Pomodoro({ pomo, settings, setSettings }) {
 }
 
 /* ================= FLASHCARDS ================= */
-function Flashcards({ decks, setDecks, giveXP }) {
+const escHtml = (t) => String(t ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r?\n/g, "<br>");
+// Cartões antigos são texto puro; ao editar, viram HTML (sem perder quebras de linha)
+const cardSideHtml = (c, side) => (c.html ? c[side] : escHtml(c[side]));
+const cardPlain = (c, side) => (c.html ? htmlToPlainText(c[side]) : String(c[side] ?? ""));
+
+function MoveCardsDialog({ decks, fromDeckId, count, onMove, onCreateAndMove, onClose }) {
+  const [newName, setNewName] = useState("");
+  const targets = decks.filter((d) => d.id !== fromDeckId);
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(5,9,16,0.7)" }} onClick={onClose}>
+      <div className="w-full max-w-sm rounded-xl border p-4" style={{ background: COLORS.card, borderColor: COLORS.cardBorder }} onClick={(e) => e.stopPropagation()}>
+        <SectionTitle icon={FolderInput}>Mover {count} {count === 1 ? "cartão" : "cartões"}</SectionTitle>
+        <p className="text-[11px] mb-3" style={{ color: COLORS.sub }}>O progresso de revisão (caixa e data) é mantido.</p>
+        <div className="space-y-1 max-h-52 overflow-auto mb-3">
+          {targets.map((d) => (
+            <button key={d.id} onClick={() => onMove(d.id)} className="w-full text-left text-sm px-3 py-2 rounded-lg"
+              style={{ background: COLORS.bg2, color: COLORS.text }}>
+              {d.name} <span className="text-[11px]" style={{ color: COLORS.sub }}>({d.cards.length})</span>
+            </button>
+          ))}
+          {!targets.length && <p className="text-xs" style={{ color: COLORS.sub }}>Não há outro baralho. Crie um abaixo.</p>}
+        </div>
+        <div className="flex gap-2 mb-3">
+          <Input placeholder="Novo baralho..." value={newName} onChange={(e) => setNewName(e.target.value)} className="flex-1" />
+          <Btn small onClick={() => newName.trim() && onCreateAndMove(newName.trim())}><Plus size={13} /> Criar e mover</Btn>
+        </div>
+        <Btn variant="ghost" small onClick={onClose}>Cancelar</Btn>
+      </div>
+    </div>
+  );
+}
+
+function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
   const [deckName, setDeckName] = useState("");
   const [activeDeckId, setActiveDeckId] = useState(null);
   const [form, setForm] = useState({ front: "", back: "" });
@@ -1282,6 +1343,14 @@ function Flashcards({ decks, setDecks, giveXP }) {
   const [studyAll, setStudyAll] = useState(false); // false = só os que vencem hoje
   const [reviewed, setReviewed] = useState(0);
   const [flipped, setFlipped] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState({ front: "", back: "" });
+  const [renamingDeckId, setRenamingDeckId] = useState(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState(() => new Set());
+  const [moveIds, setMoveIds] = useState(null); // ids sendo movidos (abre o diálogo)
+  const [undoInfo, setUndoInfo] = useState(null);
 
   const activeDeck = decks.find((d) => d.id === activeDeckId);
 
@@ -1291,11 +1360,13 @@ function Flashcards({ decks, setDecks, giveXP }) {
     setQueue(buildQueue(deck, all));
     setReviewed(0);
     setFlipped(false);
+    setUndoInfo(null);
   };
-  // Refaz a fila quando troca de baralho ou quando cartões são adicionados/removidos/importados
+  // Refaz a fila quando troca de baralho ou quando cartões são adicionados/removidos/movidos/importados
   useEffect(() => {
     startSession(activeDeck, studyAll);
   }, [activeDeckId, activeDeck ? activeDeck.cards.length : 0]); // eslint-disable-line
+  useEffect(() => { setSelected(new Set()); setSelectMode(false); setEditingId(null); }, [activeDeckId]);
 
   const current = activeDeck && queue.length ? activeDeck.cards.find((c) => c.id === queue[0]) : null;
 
@@ -1307,22 +1378,119 @@ function Flashcards({ decks, setDecks, giveXP }) {
     setActiveDeckId(d.id);
   };
   const removeDeck = (id) => { setDecks((prev) => prev.filter((d) => d.id !== id)); if (activeDeckId === id) setActiveDeckId(null); };
+  const saveDeckName = () => {
+    const name = renameValue.trim();
+    if (name) setDecks((prev) => prev.map((d) => (d.id === renamingDeckId ? { ...d, name } : d)));
+    setRenamingDeckId(null);
+  };
   const addCard = () => {
-    if (!form.front.trim() || !form.back.trim() || !activeDeckId) return;
-    setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: [...d.cards, { id: uid(), front: form.front, back: form.back, box: 1 }] } : d));
+    if (isEmptyHtml(form.front) || isEmptyHtml(form.back) || !activeDeckId) return;
+    setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: [...d.cards, { id: uid(), front: form.front, back: form.back, box: 1, html: true }] } : d));
     setForm({ front: "", back: "" });
   };
-  const removeCard = (cardId) => setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: d.cards.filter((c) => c.id !== cardId) } : d));
+  const removeCard = (cardId) => {
+    setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: d.cards.filter((c) => c.id !== cardId) } : d));
+    setSelected((s) => { const n = new Set(s); n.delete(cardId); return n; });
+  };
+  const removeSelected = () => {
+    if (!selected.size) return;
+    setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: d.cards.filter((c) => !selected.has(c.id)) } : d));
+    setSelected(new Set());
+  };
+
+  // Editar mantém id, caixa, dueAt, lastReview e guid (só front/back mudam)
+  const startEdit = (c) => { setEditingId(c.id); setEditForm({ front: cardSideHtml(c, "front"), back: cardSideHtml(c, "back") }); };
+  const saveEdit = () => {
+    if (isEmptyHtml(editForm.front) || isEmptyHtml(editForm.back)) return;
+    setDecks((prev) => prev.map((d) => d.id === activeDeckId
+      ? { ...d, cards: d.cards.map((c) => (c.id === editingId ? { ...c, front: editForm.front, back: editForm.back, html: true } : c)) } : d));
+    setEditingId(null);
+  };
+
+  // Mover preserva o objeto do cartão (progresso incluído)
+  const moveCards = (ids, targetId) => {
+    const idSet = new Set(ids);
+    setDecks((prev) => {
+      const moving = [];
+      const without = prev.map((d) => {
+        const keep = [];
+        for (const c of d.cards) (idSet.has(c.id) ? moving : keep).push(c);
+        return { ...d, cards: keep };
+      });
+      return without.map((d) => (d.id === targetId ? { ...d, cards: [...d.cards, ...moving] } : d));
+    });
+    setSelected(new Set());
+    setSelectMode(false);
+    setMoveIds(null);
+  };
+  const createAndMove = (name) => {
+    const ids = moveIds || [];
+    const idSet = new Set(ids);
+    const newId = uid();
+    setDecks((prev) => {
+      const moving = prev.flatMap((d) => d.cards.filter((c) => idSet.has(c.id)));
+      const without = prev.map((d) => ({ ...d, cards: d.cards.filter((c) => !idSet.has(c.id)) }));
+      return [...without, { id: newId, name, cards: moving }];
+    });
+    setSelected(new Set());
+    setSelectMode(false);
+    setMoveIds(null);
+  };
+  const toggleSelect = (id) => setSelected((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+
   const markCard = (know) => {
     if (!current) return;
+    const before = getGam ? getGam() : null;
+    let after = null;
+    if (know && giveXP) { const r = giveXP("flashcardKnow"); after = r && r.gam; }
+    setUndoInfo({
+      cardId: current.id,
+      prev: { box: current.box, dueAt: current.dueAt, lastReview: current.lastReview },
+      know, before, after,
+    });
     // Revisão espaçada: acertou sobe de caixa (intervalo maior); errou volta para a caixa 1
     setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: d.cards.map((c) => (c.id === current.id ? reviewCard(c, know) : c)) } : d));
-    if (know && giveXP) giveXP("flashcardKnow");
     // Acertou: sai da fila. Errou: volta para o fim da fila desta sessão
     setQueue((q) => (know ? q.slice(1) : [...q.slice(1), q[0]]));
     setReviewed((n) => n + 1);
     setFlipped(false);
   };
+
+  // Desfaz a última resposta: devolve caixa/data do cartão, o cartão à frente da fila e o XP
+  const undoLast = () => {
+    if (!undoInfo) return;
+    const { cardId, prev, know, before, after } = undoInfo;
+    setDecks((p) => p.map((d) => ({
+      ...d,
+      cards: d.cards.map((c) => {
+        if (c.id !== cardId) return c;
+        const { box, dueAt, lastReview, ...rest } = c;
+        const restored = { ...rest, box: prev.box };
+        if (prev.dueAt !== undefined) restored.dueAt = prev.dueAt;
+        if (prev.lastReview !== undefined) restored.lastReview = prev.lastReview;
+        return restored;
+      }),
+    })));
+    if (activeDeck && activeDeck.cards.some((c) => c.id === cardId)) setQueue((q) => [cardId, ...q.filter((x) => x !== cardId)]);
+    setReviewed((n) => Math.max(0, n - 1));
+    setFlipped(false);
+    if (know && undoXP) undoXP(before, after);
+    setUndoInfo(null);
+  };
+  // Ctrl+Z fora de campos de texto
+  const undoRef = useRef(undoLast);
+  undoRef.current = undoLast;
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.key.toLowerCase() !== "z") return;
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      e.preventDefault();
+      undoRef.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   return (
     <div className="space-y-5">
@@ -1335,11 +1503,22 @@ function Flashcards({ decks, setDecks, giveXP }) {
         <div className="flex flex-wrap gap-2">
           {decks.map((d) => (
             <div key={d.id} className="flex items-center gap-1.5">
-              <button onClick={() => { setActiveDeckId(d.id); setFlipped(false); }}
-                className="px-3 py-1.5 rounded-lg text-xs font-medium" style={{ background: activeDeckId === d.id ? COLORS.teal : COLORS.bg2, color: activeDeckId === d.id ? "#0B121D" : COLORS.sub }}>
-                {d.name} ({d.cards.length}{d.cards.filter((c) => isCardDue(c)).length ? ` · ${d.cards.filter((c) => isCardDue(c)).length} p/ revisar` : ""})
-              </button>
-              <button onClick={() => removeDeck(d.id)}><Trash2 size={12} style={{ color: COLORS.rose }} /></button>
+              {renamingDeckId === d.id ? (
+                <>
+                  <Input value={renameValue} onChange={(e) => setRenameValue(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") saveDeckName(); if (e.key === "Escape") setRenamingDeckId(null); }} className="!py-1 text-xs" autoFocus />
+                  <button onClick={saveDeckName} title="Salvar nome"><Check size={13} style={{ color: COLORS.teal }} /></button>
+                  <button onClick={() => setRenamingDeckId(null)} title="Cancelar"><X size={13} style={{ color: COLORS.sub }} /></button>
+                </>
+              ) : (
+                <>
+                  <button onClick={() => { setActiveDeckId(d.id); setFlipped(false); }}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium" style={{ background: activeDeckId === d.id ? COLORS.teal : COLORS.bg2, color: activeDeckId === d.id ? "#0B121D" : COLORS.sub }}>
+                    {d.name} ({d.cards.length}{d.cards.filter((c) => isCardDue(c)).length ? ` · ${d.cards.filter((c) => isCardDue(c)).length} p/ revisar` : ""})
+                  </button>
+                  <button onClick={() => { setRenamingDeckId(d.id); setRenameValue(d.name); }} title="Renomear baralho"><Pencil size={12} style={{ color: COLORS.sub }} /></button>
+                  <button onClick={() => removeDeck(d.id)} title="Excluir baralho"><Trash2 size={12} style={{ color: COLORS.rose }} /></button>
+                </>
+              )}
             </div>
           ))}
           {!decks.length && <p className="text-xs" style={{ color: COLORS.sub }}>Crie seu primeiro baralho para começar.</p>}
@@ -1351,16 +1530,54 @@ function Flashcards({ decks, setDecks, giveXP }) {
           <Card>
             <SectionTitle icon={Plus}>Novo cartão em "{activeDeck.name}"</SectionTitle>
             <div className="grid sm:grid-cols-2 gap-2">
-              <Input placeholder="Frente (pergunta)" value={form.front} onChange={(e) => setForm({ ...form, front: e.target.value })} />
-              <Input placeholder="Verso (resposta)" value={form.back} onChange={(e) => setForm({ ...form, back: e.target.value })} />
+              <RichTextEditor label="Frente" placeholder="Frente (pergunta)" value={form.front} onChange={(v) => setForm((f) => ({ ...f, front: v }))} />
+              <RichTextEditor label="Verso" placeholder="Verso (resposta)" value={form.back} onChange={(v) => setForm((f) => ({ ...f, back: v }))} />
             </div>
             <Btn onClick={addCard} className="mt-2"><Check size={14} /> Adicionar cartão</Btn>
-            <div className="mt-3 space-y-1">
+
+            {activeDeck.cards.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 mt-4 mb-2">
+                <Btn small variant={selectMode ? "solid" : "ghost"} onClick={() => { setSelectMode((v) => !v); setSelected(new Set()); }}>
+                  <ListChecks size={13} /> {selectMode ? "Sair da seleção" : "Selecionar"}
+                </Btn>
+                {selectMode && (
+                  <>
+                    <Btn small variant="ghost" onClick={() => setSelected(selected.size === activeDeck.cards.length ? new Set() : new Set(activeDeck.cards.map((c) => c.id)))}>
+                      {selected.size === activeDeck.cards.length ? "Limpar" : "Todos"}
+                    </Btn>
+                    <Btn small variant="ghost" onClick={() => selected.size && setMoveIds(Array.from(selected))}><FolderInput size={13} /> Mover ({selected.size})</Btn>
+                    <Btn small variant="danger" onClick={removeSelected}><Trash2 size={13} /> Excluir ({selected.size})</Btn>
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="mt-2 space-y-1">
               {activeDeck.cards.map((c) => (
-                <div key={c.id} className="flex items-center gap-2 text-xs px-2 py-1.5 rounded" style={{ background: COLORS.bg2 }}>
-                  <span className="flex-1 truncate">{c.front}</span>
-                  <button onClick={() => removeCard(c.id)}><Trash2 size={12} style={{ color: COLORS.rose }} /></button>
-                </div>
+                editingId === c.id ? (
+                  <div key={c.id} className="rounded-lg border p-2 space-y-2" style={{ borderColor: COLORS.gold, background: COLORS.bg2 }}>
+                    <RichTextEditor label="Frente" value={editForm.front} onChange={(v) => setEditForm((f) => ({ ...f, front: v }))} />
+                    <RichTextEditor label="Verso" value={editForm.back} onChange={(v) => setEditForm((f) => ({ ...f, back: v }))} />
+                    <div className="flex gap-2">
+                      <Btn small onClick={saveEdit}><Check size={13} /> Salvar</Btn>
+                      <Btn small variant="ghost" onClick={() => setEditingId(null)}>Cancelar</Btn>
+                    </div>
+                    <p className="text-[10px]" style={{ color: COLORS.sub }}>Editar mantém a caixa e a data de revisão do cartão.</p>
+                  </div>
+                ) : (
+                  <div key={c.id} className="flex items-center gap-2 text-xs px-2 py-1.5 rounded" style={{ background: COLORS.bg2 }}>
+                    {selectMode && (
+                      <button onClick={() => toggleSelect(c.id)} title="Selecionar">
+                        {selected.has(c.id) ? <CheckSquare size={14} style={{ color: COLORS.gold }} /> : <Square size={14} style={{ color: COLORS.sub }} />}
+                      </button>
+                    )}
+                    <span className="flex-1 truncate">{cardPlain(c, "front") || "[imagem]"}</span>
+                    <span className="text-[10px] font-mono" style={{ color: COLORS.sub }}>cx {c.box || 1}</span>
+                    <button onClick={() => startEdit(c)} title="Editar cartão"><Pencil size={12} style={{ color: COLORS.sub }} /></button>
+                    <button onClick={() => setMoveIds([c.id])} title="Mover para outro baralho"><FolderInput size={12} style={{ color: COLORS.sub }} /></button>
+                    <button onClick={() => removeCard(c.id)} title="Excluir cartão"><Trash2 size={12} style={{ color: COLORS.rose }} /></button>
+                  </div>
+                )
               ))}
             </div>
           </Card>
@@ -1373,15 +1590,16 @@ function Flashcards({ decks, setDecks, giveXP }) {
                   <p className="text-[11px] mb-2 font-mono" style={{ color: COLORS.sub }}>
                     {studyAll ? "Todos os cartões" : "Revisão de hoje"} · na fila: {queue.length} · revisados: {reviewed}
                   </p>
-                  <div onClick={() => setFlipped((f) => !f)} className="w-full max-w-md h-52 rounded-xl border-2 flex items-center justify-center text-center px-6 cursor-pointer select-none"
+                  <div onClick={() => setFlipped((f) => !f)} className="w-full max-w-md min-h-[13rem] rounded-xl border-2 flex items-center justify-center text-center px-6 py-4 cursor-pointer select-none"
                     style={{ borderColor: COLORS.gold, background: COLORS.bg2 }}>
-                    <p className="font-display text-lg whitespace-pre-wrap">{flipped ? current.back : current.front}</p>
+                    <RichFace className="font-display text-lg max-h-full overflow-auto" html={current.html} text={flipped ? current.back : current.front} />
                   </div>
                   <p className="text-[11px] mt-2" style={{ color: COLORS.sub }}>Toque no cartão para virar · caixa {current.box || 1} de 5</p>
                   <div className="flex items-center gap-3 mt-4">
                     <Btn onClick={() => markCard(false)} variant="danger"><X size={14} /> Não sabia</Btn>
                     <Btn onClick={() => markCard(true)}><Check size={14} /> Sabia</Btn>
                   </div>
+                  {undoInfo && <Btn onClick={undoLast} variant="ghost" small className="mt-3"><Undo2 size={13} /> Desfazer última resposta (Ctrl+Z)</Btn>}
                 </>
               ) : (
                 <div className="text-center">
@@ -1394,6 +1612,7 @@ function Flashcards({ decks, setDecks, giveXP }) {
                       : "Os cartões voltam na data da próxima revisão. Você também pode estudar tudo agora."}
                   </p>
                   <div className="flex items-center justify-center gap-2">
+                    {undoInfo && <Btn onClick={undoLast} variant="ghost" small><Undo2 size={13} /> Desfazer última resposta</Btn>}
                     <Btn onClick={() => startSession(activeDeck, true)} variant="ghost" small><RotateCcw size={13} /> Estudar todos os cartões</Btn>
                   </div>
                 </div>
@@ -1401,6 +1620,11 @@ function Flashcards({ decks, setDecks, giveXP }) {
             </Card>
           )}
         </>
+      )}
+
+      {moveIds && (
+        <MoveCardsDialog decks={decks} fromDeckId={activeDeckId} count={moveIds.length}
+          onMove={(targetId) => moveCards(moveIds, targetId)} onCreateAndMove={createAndMove} onClose={() => setMoveIds(null)} />
       )}
 
       <AnkiPanel decks={decks} setDecks={setDecks} activeDeck={activeDeck} />
@@ -1424,6 +1648,7 @@ function AnkiPanel({ decks, setDecks, activeDeck }) {
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
   const [pasteText, setPasteText] = useState("");
+  const [withHistory, setWithHistory] = useState(true);
   const fileRef = useRef(null);
 
   const useCurrent = scope === "current" && !!activeDeck;
@@ -1445,20 +1670,21 @@ function AnkiPanel({ decks, setDecks, activeDeck }) {
     if (!totalCards) { setStatus({ type: "err", text: "Não há cartões para exportar." }); return; }
     setBusy(true); setStatus(null);
     try {
-      const blob = await buildApkgBlob(target.filter((d) => d.cards.length));
+      const blob = await buildApkgBlob(target.filter((d) => d.cards.length), { withHistory });
       downloadBlob(blob, `anki-${baseName}-${stamp}.apkg`);
-      setStatus({ type: "ok", text: `${totalCards} cartão(ões) exportado(s) em .apkg. Abra o arquivo com o Anki (ou Arquivo > Importar).` });
+      setStatus({ type: "ok", text: `${totalCards} cartão(ões) exportado(s) em .apkg${withHistory ? " com o progresso de revisão" : ""}. Abra o arquivo com o Anki (ou Arquivo > Importar).` });
     } catch (e) {
       setStatus({ type: "err", text: e.message || "Não foi possível gerar o .apkg." });
     } finally { setBusy(false); }
   };
 
-  const finishImport = (cards, skipped, extra = "") => {
+  const finishImport = (cards, skipped, extra = "", withProgress = 0) => {
     if (!cards.length) { setStatus({ type: "err", text: "Nenhum cartão válido encontrado no arquivo." + extra }); return; }
     const merged = mergeImportedCards(decks, cards, uid);
     setDecks(merged.decks);
     const parts = [`${merged.added} cartão(ões) importado(s) em ${merged.deckCount} baralho(s)`];
     if (merged.dup) parts.push(`${merged.dup} repetido(s) ignorado(s)`);
+    if (withProgress) parts.push(`${withProgress} com progresso de revisão preservado`);
     if (skipped) parts.push(`${skipped} sem frente/verso ignorado(s)`);
     setStatus({ type: "ok", text: parts.join(" · ") + "." + extra });
   };
@@ -1471,7 +1697,7 @@ function AnkiPanel({ decks, setDecks, activeDeck }) {
     try {
       if (/\.(apkg|colpkg)$/i.test(file.name)) {
         const r = await parseApkgFile(file);
-        finishImport(r.cards, r.skipped, " Imagens e áudios não são importados.");
+        finishImport(r.cards, r.skipped, " Imagens e áudios não são importados.", r.withProgress || 0);
       } else {
         const text = await file.text();
         const r = parseAnkiText(text, { defaultDeck: activeDeck?.name || file.name.replace(/\.[^.]+$/, "") });
@@ -1503,9 +1729,13 @@ function AnkiPanel({ decks, setDecks, activeDeck }) {
         </Select>
         <Btn onClick={exportTxt} small variant="ghost"><Download size={13} /> Texto (.txt)</Btn>
         <Btn onClick={exportApkg} small><Download size={13} /> Pacote Anki (.apkg)</Btn>
+        <label className="flex items-center gap-1.5 text-[11px] cursor-pointer" style={{ color: COLORS.sub }}>
+          <input type="checkbox" checked={withHistory} onChange={(e) => setWithHistory(e.target.checked)} />
+          Incluir progresso de revisão (.apkg)
+        </label>
       </div>
       <p className="text-[11px] mb-4" style={{ color: COLORS.sub }}>
-        O .txt traz o nome do baralho em cada linha (ao exportar todos) e o .apkg já cria os baralhos no Anki. Cartões novos, sem histórico de revisão.
+        O .txt traz o nome do baralho em cada linha (ao exportar todos) e o .apkg já cria os baralhos no Anki. O .txt sempre leva só o texto; no .apkg, com a opção marcada, o Anki recebe a caixa e a próxima revisão de cada cartão (aproximadas, pois o Anki usa outro algoritmo); desmarcada, os cartões entram como novos.
       </p>
 
       <p className="text-xs mb-2" style={{ color: COLORS.sub }}>Importar</p>
@@ -1515,7 +1745,7 @@ function AnkiPanel({ decks, setDecks, activeDeck }) {
         {busy && <span className="text-xs animate-pulse" style={{ color: COLORS.sub }}>Processando…</span>}
       </div>
       <p className="text-[11px] mb-3" style={{ color: COLORS.sub }}>
-        Aceita .apkg e .colpkg (baralhos completos) e texto/CSV/TSV exportados do Anki ou de planilhas (frente na 1ª coluna, verso na 2ª). Cartões repetidos são ignorados. Se for texto sem nome de baralho, vai para o baralho selecionado (ou para um novo com o nome do arquivo).
+        Aceita .apkg e .colpkg (baralhos completos, com o progresso de revisão) e texto/CSV/TSV exportados do Anki ou de planilhas (frente na 1ª coluna, verso na 2ª). Cartões repetidos são ignorados. Se for texto sem nome de baralho, vai para o baralho selecionado (ou para um novo com o nome do arquivo).
       </p>
 
       <p className="text-xs mb-2" style={{ color: COLORS.sub }}>Colar vários cartões de uma vez</p>
