@@ -226,3 +226,15 @@ build, não no `npm run dev`.
   entre celular e computador automaticamente.
 - Os lembretes da Agenda tocam som/notificação enquanto o app está aberto no
   navegador; não são alarmes do sistema operacional.
+
+## Sub-baralhos (hierarquia estilo Anki)
+
+Os baralhos agora podem ser organizados em árvore, como no Anki. O separador
+é `::` e o nome do baralho guarda o caminho completo:
+
+- `Direito` → `Direito::Administrativo` → `Direito::Administrativo::Licitações`
+- Use **+** ao lado de um baralho para criar um sub-baralho dentro dele.
+- Use a seta (▸/▾) para recolher ou expandir; **Expandir tudo / Recolher tudo** no topo.
+- Renomear ou mover um baralho leva os sub-baralhos junto.
+- Importar/exportar .apkg e .txt do Anki preserva a hierarquia (`::`).
+- Os dados antigos continuam funcionando: a árvore é derivada do nome.

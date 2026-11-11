@@ -29,6 +29,8 @@ import { estimateCompletion, examInfo, subtopicHours, MAX_DAYS } from "./estimat
 import {
   parseAnkiText, buildAnkiText, buildApkgBlob, parseApkgFile, mergeImportedCards,
 } from "./anki.js";
+import DeckTree from "./DeckTree.jsx";
+import { moveDeckPath, renameDeckPath, uniqueDeckName } from "./deckTree.js";
 
 /* ---------------------------------------------------------------
    TOKENS — "Diário Oficial de Estudos"
@@ -1340,20 +1342,17 @@ function MoveCardsDialog({ decks, fromDeckId, count, onMove, onCreateAndMove, on
 }
 
 function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
-  const [deckName, setDeckName] = useState("");
   const [activeDeckId, setActiveDeckId] = useState(null);
   const [form, setForm] = useState({ front: "", back: "" });
-  const [queue, setQueue] = useState([]);        // ids dos cartões da sessão de estudo
-  const [studyAll, setStudyAll] = useState(false); // false = só os que vencem hoje
+  const [queue, setQueue] = useState([]);
+  const [studyAll, setStudyAll] = useState(false);
   const [reviewed, setReviewed] = useState(0);
   const [flipped, setFlipped] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [editForm, setEditForm] = useState({ front: "", back: "" });
-  const [renamingDeckId, setRenamingDeckId] = useState(null);
-  const [renameValue, setRenameValue] = useState("");
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState(() => new Set());
-  const [moveIds, setMoveIds] = useState(null); // ids sendo movidos (abre o diálogo)
+  const [moveIds, setMoveIds] = useState(null);
   const [undoInfo, setUndoInfo] = useState(null);
 
   const activeDeck = decks.find((d) => d.id === activeDeckId);
@@ -1366,7 +1365,6 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
     setFlipped(false);
     setUndoInfo(null);
   };
-  // Refaz a fila quando troca de baralho ou quando cartões são adicionados/removidos/movidos/importados
   useEffect(() => {
     startSession(activeDeck, studyAll);
   }, [activeDeckId, activeDeck ? activeDeck.cards.length : 0]); // eslint-disable-line
@@ -1374,22 +1372,30 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
 
   const current = activeDeck && queue.length ? activeDeck.cards.find((c) => c.id === queue[0]) : null;
 
-  const addDeck = () => {
-    if (!deckName.trim()) return;
-    const d = { id: uid(), name: deckName.trim(), cards: [] };
+  /* ---------- operações de baralho (via DeckTree) ---------- */
+  // Cria na raiz ou dentro de um pai. Usa `uniqueDeckName` para não duplicar.
+  const createDeck = (fullName) => {
+    const name = uniqueDeckName(decks, fullName);
+    const d = { id: uid(), name, cards: [] };
     setDecks((prev) => [...prev, d]);
-    setDeckName("");
     setActiveDeckId(d.id);
   };
-  const removeDeck = (id) => { setDecks((prev) => prev.filter((d) => d.id !== id)); if (activeDeckId === id) setActiveDeckId(null); };
-  const saveDeckName = () => {
-    const name = renameValue.trim();
-    if (name) setDecks((prev) => prev.map((d) => (d.id === renamingDeckId ? { ...d, name } : d)));
-    setRenamingDeckId(null);
+  const removeDeck = (id) => {
+    const deck = decks.find((d) => d.id === id);
+    if (!deck) return;
+    const msg = deck.cards.length
+      ? `Excluir "${deck.name}" e seus ${deck.cards.length} cartão(ões)?`
+      : `Excluir "${deck.name}"?`;
+    if (!window.confirm(msg)) return;
+    setDecks((prev) => prev.filter((d) => d.id !== id));
+    if (activeDeckId === id) setActiveDeckId(null);
   };
+
   const addCard = () => {
     if (isEmptyHtml(form.front) || isEmptyHtml(form.back) || !activeDeckId) return;
-    setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: [...d.cards, { id: uid(), front: form.front, back: form.back, box: 1, html: true }] } : d));
+    setDecks((prev) => prev.map((d) => d.id === activeDeckId
+      ? { ...d, cards: [...d.cards, { id: uid(), front: form.front, back: form.back, box: 1, html: true }] }
+      : d));
     setForm({ front: "", back: "" });
   };
   const removeCard = (cardId) => {
@@ -1402,16 +1408,15 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
     setSelected(new Set());
   };
 
-  // Editar mantém id, agendamento (FSRS/caixa, datas) e guid (só front/back mudam)
   const startEdit = (c) => { setEditingId(c.id); setEditForm({ front: cardSideHtml(c, "front"), back: cardSideHtml(c, "back") }); };
   const saveEdit = () => {
     if (isEmptyHtml(editForm.front) || isEmptyHtml(editForm.back)) return;
     setDecks((prev) => prev.map((d) => d.id === activeDeckId
-      ? { ...d, cards: d.cards.map((c) => (c.id === editingId ? { ...c, front: editForm.front, back: editForm.back, html: true } : c)) } : d));
+      ? { ...d, cards: d.cards.map((c) => (c.id === editingId ? { ...c, front: editForm.front, back: editForm.back, html: true } : c)) }
+      : d));
     setEditingId(null);
   };
 
-  // Mover preserva o objeto do cartão (progresso incluído)
   const moveCards = (ids, targetId) => {
     const idSet = new Set(ids);
     setDecks((prev) => {
@@ -1434,7 +1439,7 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
     setDecks((prev) => {
       const moving = prev.flatMap((d) => d.cards.filter((c) => idSet.has(c.id)));
       const without = prev.map((d) => ({ ...d, cards: d.cards.filter((c) => !idSet.has(c.id)) }));
-      return [...without, { id: newId, name, cards: moving }];
+      return [...without, { id: newId, name: uniqueDeckName(without, name), cards: moving }];
     });
     setSelected(new Set());
     setSelectMode(false);
@@ -1442,7 +1447,6 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
   };
   const toggleSelect = (id) => setSelected((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
-  // rating: RATING.AGAIN | HARD | GOOD | EASY (FSRS). Qualquer resposta diferente de "De novo" conta como acerto.
   const markCard = (rating) => {
     if (!current) return;
     const know = rating !== RATING.AGAIN;
@@ -1455,16 +1459,14 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
       prev: snapshotScheduling(current),
       know, before, after,
     });
-    // Revisão espaçada (FSRS): grava o novo agendamento, sem mexer em frente/verso
-    setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: d.cards.map((c) => (c.id === current.id ? withScheduling(c, updated) : c)) } : d));
-    // Cartão que ficou em aprendizado (errou ou ainda nos passos curtos) volta para o fim da fila da sessão;
-    // cartão que foi para revisão sai da fila
+    setDecks((prev) => prev.map((d) => d.id === activeDeckId
+      ? { ...d, cards: d.cards.map((c) => (c.id === current.id ? withScheduling(c, updated) : c)) }
+      : d));
     setQueue((q) => (isLearning(updated) ? [...q.slice(1), q[0]] : q.slice(1)));
     setReviewed((n) => n + 1);
     setFlipped(false);
   };
 
-  // Desfaz a última resposta: devolve o agendamento do cartão, o cartão à frente da fila e o XP
   const undoLast = () => {
     if (!undoInfo) return;
     const { cardId, prev, know, before, after } = undoInfo;
@@ -1481,7 +1483,6 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
     if (know && undoXP) undoXP(before, after);
     setUndoInfo(null);
   };
-  // Ctrl+Z fora de campos de texto
   const undoRef = useRef(undoLast);
   undoRef.current = undoLast;
   useEffect(() => {
@@ -1498,35 +1499,20 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
 
   return (
     <div className="space-y-5">
+      {/* ---------- Baralhos (árvore) ---------- */}
       <Card>
         <SectionTitle icon={Layers}>Baralhos</SectionTitle>
-        <div className="flex gap-2 mb-3">
-          <Input placeholder="Nome do baralho (ex: Direito Administrativo)" value={deckName} onChange={(e) => setDeckName(e.target.value)} className="flex-1" />
-          <Btn onClick={addDeck}><Plus size={14} /> Criar</Btn>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          {decks.map((d) => (
-            <div key={d.id} className="flex items-center gap-1.5">
-              {renamingDeckId === d.id ? (
-                <>
-                  <Input value={renameValue} onChange={(e) => setRenameValue(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") saveDeckName(); if (e.key === "Escape") setRenamingDeckId(null); }} className="!py-1 text-xs" autoFocus />
-                  <button onClick={saveDeckName} title="Salvar nome"><Check size={13} style={{ color: COLORS.teal }} /></button>
-                  <button onClick={() => setRenamingDeckId(null)} title="Cancelar"><X size={13} style={{ color: COLORS.sub }} /></button>
-                </>
-              ) : (
-                <>
-                  <button onClick={() => { setActiveDeckId(d.id); setFlipped(false); }}
-                    className="px-3 py-1.5 rounded-lg text-xs font-medium" style={{ background: activeDeckId === d.id ? COLORS.teal : COLORS.bg2, color: activeDeckId === d.id ? "#0B121D" : COLORS.sub }}>
-                    {d.name} ({d.cards.length}{d.cards.filter((c) => isDue(c)).length ? ` · ${d.cards.filter((c) => isDue(c)).length} p/ revisar` : ""})
-                  </button>
-                  <button onClick={() => { setRenamingDeckId(d.id); setRenameValue(d.name); }} title="Renomear baralho"><Pencil size={12} style={{ color: COLORS.sub }} /></button>
-                  <button onClick={() => removeDeck(d.id)} title="Excluir baralho"><Trash2 size={12} style={{ color: COLORS.rose }} /></button>
-                </>
-              )}
-            </div>
-          ))}
-          {!decks.length && <p className="text-xs" style={{ color: COLORS.sub }}>Crie seu primeiro baralho para começar.</p>}
-        </div>
+        <DeckTree
+          decks={decks}
+          activeDeckId={activeDeckId}
+          onSelectDeck={(id) => { setActiveDeckId(id); setFlipped(false); }}
+          onRenameDeck={(id, newName) => setDecks((prev) => renameDeckPath(prev, id, newName))}
+          onDeleteDeck={removeDeck}
+          onCreateChild={(_parent, full) => createDeck(full)}
+          onCreateRoot={(full) => createDeck(full)}
+          onMoveDeck={(id, newParent) => setDecks((prev) => moveDeckPath(prev, id, newParent))}
+          isDueFn={isDue}
+        />
       </Card>
 
       {activeDeck && (
