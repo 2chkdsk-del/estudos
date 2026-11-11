@@ -344,6 +344,9 @@ export function award(gam, action, ctx = {}) {
    REVISÃO ESPAÇADA (flashcards)
    ========================================================= */
 
+// LEGADO: caixas de Leitner. A tela de flashcards agora usa o FSRS (fsrs.js).
+// BOX_INTERVALS, MAX_BOX e nextDueISO ainda servem à conversão de cartões antigos e ao Anki;
+// reviewCard e isCardDue só valem para cartões que ainda não foram migrados.
 // Intervalos em dias por box. Box 1 é "novo".
 export const BOX_INTERVALS = { 1: 1, 2: 3, 3: 7, 4: 15, 5: 30 };
 export const MAX_BOX = 5;

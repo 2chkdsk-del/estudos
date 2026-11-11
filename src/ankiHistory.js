@@ -4,9 +4,10 @@
 //   - Import: ler cards (ivl/factor/type/queue/due) + revlog -> box/dueAt/lastReview
 //   - Export: gerar cards com ivl/factor/due coerentes + revlog sintético
 //
-// O mapeamento é aproximado: o Anki usa SM-2/FSRS com intervalos variáveis; o app usa
-// caixas fixas (1, 3, 7, 15, 30 dias). A "sensação" do cartão (novo/difícil/maduro) é
-// preservada, mas não os intervalos exatos.
+// Cartões ainda no formato antigo (caixas fixas de 1, 3, 7, 15 e 30 dias) usam um mapeamento
+// aproximado. Cartões já migrados para FSRS (card.fsrs) exportam o intervalo real
+// (scheduled_days). Na importação, o cartão entra no formato antigo e é convertido para
+// FSRS na primeira resposta (ver fsrs.js).
 //
 // ATENÇÃO ao calendário do Anki: o campo `due` dos cartões de revisão é o número de DIAS
 // desde a criação da coleção (`col.crt`, em segundos), e não desde 1970. Por isso as
@@ -50,6 +51,20 @@ export function boxToAnkiCardState(box) {
   const b = Math.max(1, Math.min(MAX_BOX, box || 1));
   if (b === 1) return { ivl: 0, factor: 0, type: 0, queue: 0, reps: 0 };
   return { ivl: BOX_INTERVALS[b] ?? 1, factor: FACTOR_BY_BOX[b], type: 2, queue: 2, reps: b - 1 };
+}
+
+// State.Review do ts-fsrs (0 novo, 1 aprendendo, 2 revisão, 3 reaprendendo)
+const STATE_REVIEW = 2;
+
+/**
+ * Cartão FSRS -> estado do cartão no Anki. Só cartões em revisão levam intervalo;
+ * novos e em aprendizado vão como novos. O Anki não usa `factor` com FSRS: 2500 é neutro.
+ */
+export function fsrsCardToAnkiState(card) {
+  const lapses = Math.max(0, Number(card.lapses) || 0);
+  if (card.state !== STATE_REVIEW) return { ivl: 0, factor: 0, type: 0, queue: 0, reps: 0, lapses };
+  const ivl = Math.max(1, Math.round(Number(card.scheduled_days) || 0));
+  return { ivl, factor: 2500, type: 2, queue: 2, reps: Math.max(1, Number(card.reps) || 1), lapses };
 }
 
 /* =========================================================
@@ -222,6 +237,23 @@ function synthesizeRevlogForCard(card) {
   return reviews;
 }
 
+// Um único registro de revisão com o intervalo real do cartão FSRS, datado na última revisão.
+function synthesizeRevlogForFsrsCard(card, ivl) {
+  const lastISO = card.lastReview || todayISO();
+  const [y, m, d] = lastISO.split("-").map(Number);
+  let cursor = new Date(y, m - 1, d, 12, 0, 0);
+  if (cursor.getTime() > Date.now()) cursor = new Date();
+  return [{
+    id: cursor.getTime(),
+    ease: 3,
+    ivl,
+    lastIvl: 0,
+    factor: 2500,
+    time: 15000 + Math.floor(Math.random() * 15000),
+    type: 0,
+  }];
+}
+
 /**
  * Prepara o estado de agendamento + revlog de cada cartão do app.
  * `due` fica null para cartões novos (anki.js usa a posição na fila).
@@ -231,6 +263,13 @@ export function buildProgressForExport(decks, crtSec) {
   const nowSec = Math.floor(Date.now() / 1000);
   for (const deck of decks) {
     for (const card of deck.cards) {
+      if (card.fsrs) {
+        const state = fsrsCardToAnkiState(card);
+        const inReview = state.type === 2;
+        const due = inReview ? isoToAnkiDay(card.dueAt || nextDueISO(2), crtSec) : null;
+        byCardId.set(card.id, { ...state, due, mod: nowSec, revlog: inReview ? synthesizeRevlogForFsrsCard(card, state.ivl) : [] });
+        continue;
+      }
       const box = Math.max(1, Math.min(MAX_BOX, card.box || 1));
       const state = boxToAnkiCardState(box);
       const due = box === 1 ? null : isoToAnkiDay(card.dueAt || nextDueISO(box), crtSec);

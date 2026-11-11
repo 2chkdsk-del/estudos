@@ -17,8 +17,12 @@ import RichTextEditor from "./RichTextEditor.jsx";
 import RichFace from "./RichFace.jsx";
 import { isEmptyHtml, htmlToPlainText } from "./richText.js";
 import {
-  makeGamState, normalizeGam, award, GAM_STORAGE_KEY, reviewCard, isCardDue, todayISO, weekKey,
+  makeGamState, normalizeGam, award, GAM_STORAGE_KEY, todayISO, weekKey,
 } from "./gamification.js";
+import {
+  RATING, rateCard, previewIntervals, isDue, isLearning,
+  snapshotScheduling, restoreScheduling, withScheduling, cardStatusLabel,
+} from "./fsrs.js";
 import { GamHeaderStrip, DailyGoalBar, RewardToast, AchievementsScreen } from "./GamificationUI.jsx";
 import { greeting, streakWarning, comebackMessage, narrativeForAction, goalHitMessage } from "./gamificationNarrative.js";
 import { estimateCompletion, examInfo, subtopicHours, MAX_DAYS } from "./estimate.js";
@@ -1315,7 +1319,7 @@ function MoveCardsDialog({ decks, fromDeckId, count, onMove, onCreateAndMove, on
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(5,9,16,0.7)" }} onClick={onClose}>
       <div className="w-full max-w-sm rounded-xl border p-4" style={{ background: COLORS.card, borderColor: COLORS.cardBorder }} onClick={(e) => e.stopPropagation()}>
         <SectionTitle icon={FolderInput}>Mover {count} {count === 1 ? "cartão" : "cartões"}</SectionTitle>
-        <p className="text-[11px] mb-3" style={{ color: COLORS.sub }}>O progresso de revisão (caixa e data) é mantido.</p>
+        <p className="text-[11px] mb-3" style={{ color: COLORS.sub }}>O progresso de revisão (memória e data) é mantido.</p>
         <div className="space-y-1 max-h-52 overflow-auto mb-3">
           {targets.map((d) => (
             <button key={d.id} onClick={() => onMove(d.id)} className="w-full text-left text-sm px-3 py-2 rounded-lg"
@@ -1354,7 +1358,7 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
 
   const activeDeck = decks.find((d) => d.id === activeDeckId);
 
-  const buildQueue = (deck, all) => (deck ? deck.cards.filter((c) => all || isCardDue(c)).map((c) => c.id) : []);
+  const buildQueue = (deck, all) => (deck ? deck.cards.filter((c) => all || isDue(c)).map((c) => c.id) : []);
   const startSession = (deck, all = false) => {
     setStudyAll(all);
     setQueue(buildQueue(deck, all));
@@ -1398,7 +1402,7 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
     setSelected(new Set());
   };
 
-  // Editar mantém id, caixa, dueAt, lastReview e guid (só front/back mudam)
+  // Editar mantém id, agendamento (FSRS/caixa, datas) e guid (só front/back mudam)
   const startEdit = (c) => { setEditingId(c.id); setEditForm({ front: cardSideHtml(c, "front"), back: cardSideHtml(c, "back") }); };
   const saveEdit = () => {
     if (isEmptyHtml(editForm.front) || isEmptyHtml(editForm.back)) return;
@@ -1438,25 +1442,29 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
   };
   const toggleSelect = (id) => setSelected((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
-  const markCard = (know) => {
+  // rating: RATING.AGAIN | HARD | GOOD | EASY (FSRS). Qualquer resposta diferente de "De novo" conta como acerto.
+  const markCard = (rating) => {
     if (!current) return;
+    const know = rating !== RATING.AGAIN;
     const before = getGam ? getGam() : null;
     let after = null;
     if (know && giveXP) { const r = giveXP("flashcardKnow"); after = r && r.gam; }
+    const updated = rateCard(current, rating);
     setUndoInfo({
       cardId: current.id,
-      prev: { box: current.box, dueAt: current.dueAt, lastReview: current.lastReview },
+      prev: snapshotScheduling(current),
       know, before, after,
     });
-    // Revisão espaçada: acertou sobe de caixa (intervalo maior); errou volta para a caixa 1
-    setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: d.cards.map((c) => (c.id === current.id ? reviewCard(c, know) : c)) } : d));
-    // Acertou: sai da fila. Errou: volta para o fim da fila desta sessão
-    setQueue((q) => (know ? q.slice(1) : [...q.slice(1), q[0]]));
+    // Revisão espaçada (FSRS): grava o novo agendamento, sem mexer em frente/verso
+    setDecks((prev) => prev.map((d) => d.id === activeDeckId ? { ...d, cards: d.cards.map((c) => (c.id === current.id ? withScheduling(c, updated) : c)) } : d));
+    // Cartão que ficou em aprendizado (errou ou ainda nos passos curtos) volta para o fim da fila da sessão;
+    // cartão que foi para revisão sai da fila
+    setQueue((q) => (isLearning(updated) ? [...q.slice(1), q[0]] : q.slice(1)));
     setReviewed((n) => n + 1);
     setFlipped(false);
   };
 
-  // Desfaz a última resposta: devolve caixa/data do cartão, o cartão à frente da fila e o XP
+  // Desfaz a última resposta: devolve o agendamento do cartão, o cartão à frente da fila e o XP
   const undoLast = () => {
     if (!undoInfo) return;
     const { cardId, prev, know, before, after } = undoInfo;
@@ -1464,11 +1472,7 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
       ...d,
       cards: d.cards.map((c) => {
         if (c.id !== cardId) return c;
-        const { box, dueAt, lastReview, ...rest } = c;
-        const restored = { ...rest, box: prev.box };
-        if (prev.dueAt !== undefined) restored.dueAt = prev.dueAt;
-        if (prev.lastReview !== undefined) restored.lastReview = prev.lastReview;
-        return restored;
+        return restoreScheduling(c, prev);
       }),
     })));
     if (activeDeck && activeDeck.cards.some((c) => c.id === cardId)) setQueue((q) => [cardId, ...q.filter((x) => x !== cardId)]);
@@ -1513,7 +1517,7 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
                 <>
                   <button onClick={() => { setActiveDeckId(d.id); setFlipped(false); }}
                     className="px-3 py-1.5 rounded-lg text-xs font-medium" style={{ background: activeDeckId === d.id ? COLORS.teal : COLORS.bg2, color: activeDeckId === d.id ? "#0B121D" : COLORS.sub }}>
-                    {d.name} ({d.cards.length}{d.cards.filter((c) => isCardDue(c)).length ? ` · ${d.cards.filter((c) => isCardDue(c)).length} p/ revisar` : ""})
+                    {d.name} ({d.cards.length}{d.cards.filter((c) => isDue(c)).length ? ` · ${d.cards.filter((c) => isDue(c)).length} p/ revisar` : ""})
                   </button>
                   <button onClick={() => { setRenamingDeckId(d.id); setRenameValue(d.name); }} title="Renomear baralho"><Pencil size={12} style={{ color: COLORS.sub }} /></button>
                   <button onClick={() => removeDeck(d.id)} title="Excluir baralho"><Trash2 size={12} style={{ color: COLORS.rose }} /></button>
@@ -1562,7 +1566,7 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
                       <Btn small onClick={saveEdit}><Check size={13} /> Salvar</Btn>
                       <Btn small variant="ghost" onClick={() => setEditingId(null)}>Cancelar</Btn>
                     </div>
-                    <p className="text-[10px]" style={{ color: COLORS.sub }}>Editar mantém a caixa e a data de revisão do cartão.</p>
+                    <p className="text-[10px]" style={{ color: COLORS.sub }}>Editar mantém o progresso e a data de revisão do cartão.</p>
                   </div>
                 ) : (
                   <div key={c.id} className="flex items-center gap-2 text-xs px-2 py-1.5 rounded" style={{ background: COLORS.bg2 }}>
@@ -1572,7 +1576,7 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
                       </button>
                     )}
                     <span className="flex-1 truncate">{cardPlain(c, "front") || "[imagem]"}</span>
-                    <span className="text-[10px] font-mono" style={{ color: COLORS.sub }}>cx {c.box || 1}</span>
+                    <span className="text-[10px] font-mono" style={{ color: COLORS.sub }}>{cardStatusLabel(c)}</span>
                     <button onClick={() => startEdit(c)} title="Editar cartão"><Pencil size={12} style={{ color: COLORS.sub }} /></button>
                     <button onClick={() => setMoveIds([c.id])} title="Mover para outro baralho"><FolderInput size={12} style={{ color: COLORS.sub }} /></button>
                     <button onClick={() => removeCard(c.id)} title="Excluir cartão"><Trash2 size={12} style={{ color: COLORS.rose }} /></button>
@@ -1594,10 +1598,19 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
                     style={{ borderColor: COLORS.gold, background: COLORS.bg2 }}>
                     <RichFace className="font-display text-lg max-h-full overflow-auto" html={current.html} text={flipped ? current.back : current.front} />
                   </div>
-                  <p className="text-[11px] mt-2" style={{ color: COLORS.sub }}>Toque no cartão para virar · caixa {current.box || 1} de 5</p>
-                  <div className="flex items-center gap-3 mt-4">
-                    <Btn onClick={() => markCard(false)} variant="danger"><X size={14} /> Não sabia</Btn>
-                    <Btn onClick={() => markCard(true)}><Check size={14} /> Sabia</Btn>
+                  <p className="text-[11px] mt-2" style={{ color: COLORS.sub }}>Toque no cartão para virar · {cardStatusLabel(current)}</p>
+                  <div className="grid grid-cols-4 gap-2 mt-4 w-full max-w-md">
+                    {[
+                      { rating: RATING.AGAIN, key: "again", label: "De novo", variant: "danger" },
+                      { rating: RATING.HARD, key: "hard", label: "Difícil", variant: "ghost" },
+                      { rating: RATING.GOOD, key: "good", label: "Bom", variant: "solid" },
+                      { rating: RATING.EASY, key: "easy", label: "Fácil", variant: "ghost" },
+                    ].map((b) => (
+                      <Btn key={b.key} variant={b.variant} onClick={() => markCard(b.rating)} className="flex-col justify-center !gap-0.5">
+                        <span>{b.label}</span>
+                        <span className="text-[10px] font-mono opacity-80">{previewIntervals(current)[b.key]}</span>
+                      </Btn>
+                    ))}
                   </div>
                   {undoInfo && <Btn onClick={undoLast} variant="ghost" small className="mt-3"><Undo2 size={13} /> Desfazer última resposta (Ctrl+Z)</Btn>}
                 </>
@@ -1608,7 +1621,7 @@ function Flashcards({ decks, setDecks, giveXP, undoXP, getGam }) {
                   </p>
                   <p className="text-[11px] mb-3" style={{ color: COLORS.sub }}>
                     {reviewed > 0
-                      ? "Os cartões voltam na data certa, conforme a caixa de cada um."
+                      ? "Os cartões voltam na data certa, conforme o agendamento de cada um."
                       : "Os cartões voltam na data da próxima revisão. Você também pode estudar tudo agora."}
                   </p>
                   <div className="flex items-center justify-center gap-2">
@@ -1735,7 +1748,7 @@ function AnkiPanel({ decks, setDecks, activeDeck }) {
         </label>
       </div>
       <p className="text-[11px] mb-4" style={{ color: COLORS.sub }}>
-        O .txt traz o nome do baralho em cada linha (ao exportar todos) e o .apkg já cria os baralhos no Anki. O .txt sempre leva só o texto; no .apkg, com a opção marcada, o Anki recebe a caixa e a próxima revisão de cada cartão (aproximadas, pois o Anki usa outro algoritmo); desmarcada, os cartões entram como novos.
+        O .txt traz o nome do baralho em cada linha (ao exportar todos) e o .apkg já cria os baralhos no Anki. O .txt sempre leva só o texto; no .apkg, com a opção marcada, o Anki recebe o intervalo e a próxima revisão de cada cartão (o Anki recalcula o resto com o algoritmo dele); desmarcada, os cartões entram como novos.
       </p>
 
       <p className="text-xs mb-2" style={{ color: COLORS.sub }}>Importar</p>
