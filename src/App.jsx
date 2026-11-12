@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from "react";
 import {
   Plus, Trash2, Check, X, Clock, Calendar as CalendarIcon, Play, Pause,
   RotateCcw, BookOpen, Brain, BarChart3, Lightbulb, Newspaper, Bell,
@@ -31,6 +31,7 @@ import {
 } from "./anki.js";
 import DeckTree from "./DeckTree.jsx";
 import { moveDeckPath, renameDeckPath, uniqueDeckName } from "./deckTree.js";
+const Library = lazy(() => import("./Library.jsx"));
 
 /* ---------------------------------------------------------------
    TOKENS — "Diário Oficial de Estudos"
@@ -106,7 +107,17 @@ const seedSubjects = () => [
    STORAGE HELPERS
 ----------------------------------------------------------------*/
 const STORAGE_PREFIX = "plano-estudos:";
-const DATA_KEYS = ["subjects", "schedule", "agenda", "decks", "pomo-settings", "plan-settings", "concursos", "gamification"];
+const DATA_KEYS = [
+  "subjects",
+  "schedule",
+  "agenda",
+  "decks",
+  "pomo-settings",
+  "plan-settings",
+  "concursos",
+  "gamification",
+  "library-meta", // metadados + anotações da Biblioteca (os PDFs ficam no IndexedDB)
+];
 
 async function loadKey(key, fallback) {
   try {
@@ -615,6 +626,7 @@ export default function StudyPlanner() {
     { key: "pomodoro", label: "Pomodoro", icon: Clock },
     { key: "flashcards", label: "Flashcards", icon: Layers },
     { key: "questoes", label: "Questões", icon: Brain },
+    { key: "biblioteca", label: "Biblioteca", icon: BookOpen },
     { key: "desempenho", label: "Desempenho", icon: BarChart3 },
     { key: "conquistas", label: "Conquistas", icon: Award },
     { key: "dicas", label: "Dicas", icon: Lightbulb },
@@ -667,6 +679,11 @@ export default function StudyPlanner() {
         {tab === "pomodoro" && <Pomodoro pomo={pomo} settings={pomoSettings} setSettings={setPomoSettings} />}
         {tab === "flashcards" && <Flashcards decks={decks} setDecks={setDecks} giveXP={giveXP} undoXP={undoXP} getGam={getGam} />}
         {tab === "questoes" && <Questoes giveXP={giveXP} />}
+        {tab === "biblioteca" && (
+          <Suspense fallback={<div className="py-16 text-center text-sm" style={{ color: COLORS.sub }}>Carregando biblioteca…</div>}>
+            <Library subjects={subjects} />
+          </Suspense>
+        )}
         {tab === "desempenho" && <Desempenho subjects={subjects} estimate={estimate} exam={exam} planSettings={planSettings} />}
         {tab === "conquistas" && (
           <AchievementsScreen gam={gam} onSetGoal={(v) => setGam((g) => { const n = { ...g, dailyGoal: v }; gamRef.current = n; return n; })} />

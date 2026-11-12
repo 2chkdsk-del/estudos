@@ -238,3 +238,144 @@ Os baralhos agora podem ser organizados em árvore, como no Anki. O separador
 - Renomear ou mover um baralho leva os sub-baralhos junto.
 - Importar/exportar .apkg e .txt do Anki preserva a hierarquia (`::`).
 - Os dados antigos continuam funcionando: a árvore é derivada do nome.
+
+## Biblioteca (PDFs + resumos + anotações)
+
+A aba **Biblioteca** guarda os materiais de estudo: PDFs de apostilas,
+resumos próprios e anotações soltas. Tudo fica no dispositivo, sem
+sincronização automática.
+
+### O que dá para fazer
+
+- **Enviar PDF**: clique em **Enviar PDF** (limite: 50 MB). O binário fica
+  no IndexedDB (`plano-estudos-pdfs`); os metadados (título, matéria,
+  tópico, anotações) ficam no `localStorage`, na chave
+  `plano-estudos:library-meta`.
+- **Criar resumo / anotação**: usa o mesmo editor rico dos flashcards
+  (negrito, listas, imagens, colar do clipboard).
+- **Organizar por tópico**: campo `topic` em cada item. A lista agrupa
+  por tópico, com filtro por tipo, matéria, tópico e busca textual.
+- **Reordenar com ↑↓**: dentro de cada tópico, mover item para cima/baixo.
+- **Fixar no topo (📌)**: pin dentro da seção.
+- **Seleção múltipla**: ativar "Selecionar", marcar vários, mover em lote
+  para outro tópico, fixar/desafixar em lote, excluir em lote.
+- **Buscar e filtrar**: por título, tópico, matéria ou conteúdo.
+- **Baixar o PDF**: o botão "Baixar original" salva o arquivo **limpo**
+  (sem anotações) de volta no dispositivo.
+
+### Anotações no PDF (marca-texto, escrita, borracha, desfazer)
+
+Os PDFs abrem num **leitor próprio** (renderizado em `<canvas>` via
+`pdf.js`, carregado do CDN na primeira vez). A arquitetura é de
+**"película"**:
+
+- O **PDF original** fica intocado no IndexedDB.
+- As **anotações** ficam no `localStorage`, no item, no campo
+  `annotations`. Cada anotação guarda `type` (`highlight` ou `text`),
+  `page`, `x`, `y`, `w`, `h`, `color` (destaques), `text` (escritas) e
+  `createdAt`.
+- Ao abrir, o app renderiza o PDF no `<canvas>` e desenha as anotações
+  **por cima**, como se fosse uma película.
+- **Salvar é automático**: cada mudança em `annotations` dispara o
+  `saveMeta(items)` que já existe. Não há botão "Salvar" separado.
+- **Baixar original** entrega o PDF **limpo**.
+- **Exportar com anotações** (PDF achatado) é a **Fase 2**, ainda não
+  incluída.
+
+### Ferramentas do leitor
+
+- **Marca-texto**: selecione um trecho de texto do PDF com o mouse e ele
+  vira destaque com a cor escolhida (amarelo, verde, rosa, azul). Se a
+  seleção não pegar (PDF sem camada de texto), arraste um retângulo sobre
+  a área desejada.
+- **Texto**: clique no PDF → digite → Enter confirma. O texto fica
+  ancorado nas coordenadas.
+- **Borracha**: clique num destaque/texto para excluir (ou use a lista
+  "Anotações desta página").
+- **Desfazer**: `Ctrl+Z` (fora de campo de texto) ou botão **Desfazer**.
+  Pilha por sessão; fechar o item limpa a pilha.
+- **Zoom**: 80% a 300%. As anotações são guardadas em coordenadas da
+  página (escala 1), então acompanham o zoom sem sair do lugar.
+- **Paginação**: ◀ ▶ entre páginas; cada anotação pertence a uma página.
+
+### Peso
+
+- **pdf.js** (~1 MB) e **pdf.worker** vêm do `cdnjs.cloudflare.com` na
+  primeira abertura de um PDF. Ficam em cache (o SW do PWA já cacheia o
+  CDN). O **carregamento inicial do app não muda**.
+- As anotações são leves: 100 destaques ≈ 10 KB no `localStorage`.
+- **Nenhum PDF é enviado para servidor.**
+
+### Limitações
+
+- O **pdf.js substitui o `<iframe>`**: você perde o leitor nativo do
+  navegador (busca nativa, impressão direta). Em troca, ganha anotação.
+- **Seleção de texto funciona por linha/bloco**: destaques que quebram
+  linha podem não cobrir 100% da extensão visualmente.
+- **Escrita não edita o texto do PDF** — é uma camada por cima.
+- **Não há "borracha que arrasta"**: para apagar, clique ou use a lista.
+- **Salvar com anotações achatadas** (novo PDF com destaques "queimados")
+  é a Fase 2, com `pdf-lib`.
+- **A pilha de desfazer não persiste** ao fechar o item.
+- **Anotações não sobrevivem a excluir o PDF** — elas pertencem ao item
+  da Biblioteca; se o item for excluído, o `annotations` vai junto.
+- **Os PDFs não entram no backup em JSON** — só os metadados e as
+  anotações (veja "Backup da Biblioteca" abaixo). Para cópia completa,
+  baixe cada PDF pelo botão **Baixar original**.
+
+
+
+## Backup da Biblioteca
+
+O botão **Salvar registro** (no topo do app) gera um `.json` com todos os
+dados do app no `localStorage` — e isso agora inclui a Biblioteca:
+
+- **Vão no backup**:
+  - Todos os metadados dos itens (título, matéria vinculada, tópico,
+    ordem manual, pin, tipo).
+  - **Todas as películas** (destaques com cor, textos ancorados,
+    página, coordenadas, data de criação), no campo `annotations`.
+  - O `pdfId`, o nome e o tamanho do arquivo de cada PDF.
+- **Não vão no backup**:
+  - Os **PDFs em si** (o binário de 2–20 MB de cada um). Eles ficam no
+    IndexedDB (`plano-estudos-pdfs`), e colocá-los no JSON faria o
+    arquivo ficar com centenas de MB (e o base64 ainda inflaria +33%).
+
+### Como levar a Biblioteca para outro aparelho
+
+1. No aparelho de origem: clique em **Salvar registro** e guarde o
+   `.json`.
+2. Ainda na origem: para cada PDF, abra o item e clique em
+   **Baixar original** (o PDF limpo, sem anotações) — ou guarde os
+   originais de outro jeito.
+3. No aparelho de destino: clique em **Abrir registro** e escolha o
+   `.json`. Os itens e as películas voltam.
+4. Abra um item restaurado e clique em **Vincular PDF**; escolha o
+   arquivo original. O item continua o mesmo, então as anotações são
+   preservadas e voltam a aparecer sobre o PDF.
+
+**Atenção:** não use **Enviar PDF** para reconectar um item restaurado —
+esse botão cria um **novo item** (com outro `pdfId`), e as anotações do
+item antigo não migram para ele. Use **Vincular PDF** dentro do item.
+
+Se o PDF ainda não foi vinculado, o leitor mostra "PDF não encontrado no
+armazenamento" e o botão **Vincular PDF**.
+
+### O que o backup protege
+
+- Se você limpar os dados do navegador **sem** ter feito backup: perde
+  PDFs **e** películas.
+- Se você limpar os dados **tendo** o backup: as películas voltam, mas
+  os PDFs precisam ser vinculados de novo (o backup não os carrega).
+- Se você só quer proteger as anotações (sem os PDFs): o backup já
+  basta.
+
+### Observações
+
+- O backup é **local**: o `.json` fica no disco do usuário, sem upload
+  para servidor.
+- O tamanho do `.json` é pequeno (poucos KB mesmo com dezenas de
+  películas). O que pesa são os PDFs, e eles ficam fora.
+- O campo `library-meta` foi adicionado ao `DATA_KEYS` no `App.jsx`; se
+  você tem uma versão antiga do app em outro lugar, o backup dela não
+  terá a Biblioteca (é só atualizar o `DATA_KEYS`).

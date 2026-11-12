@@ -166,8 +166,8 @@ export function rateCard(card, rating, now = new Date()) {
 
 /** Texto curto para um intervalo em milissegundos: "10 min", "3 h", "4 dias", "2 meses". */
 export function formatInterval(ms) {
+  if (ms < 60000) return "<1 min";
   const min = Math.round(ms / 60000);
-  if (min < 1) return "<1 min";
   if (min < 60) return `${min} min`;
   const h = Math.round(ms / 3600000);
   if (h < 24) return `${h} h`;
